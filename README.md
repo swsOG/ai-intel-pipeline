@@ -1,0 +1,152 @@
+# AI Intel Pipeline
+
+A self-hosted AI intelligence briefing system that scans 15+ sources daily, filters with Gemini AI, and delivers a ranked digest to your email and Telegram — configured through a web control panel.
+
+---
+
+## How it works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Sources (15+)                       │
+│  RSS Blogs · GitHub Trending · Hacker News · Reddit     │
+│  Product Hunt · Hugging Face · TechCrunch · The Verge   │
+└───────────────────────┬─────────────────────────────────┘
+                        │ raw items (~150/run)
+                        ▼
+               ┌────────────────┐
+               │    Fetcher     │  pipeline_runner.py
+               │  RSS / JSON /  │  fetch_rss(), fetch_reddit(),
+               │  HTML scrape   │  fetch_github()
+               └───────┬────────┘
+                        │ normalised {title, url, summary, source}
+                        ▼
+               ┌────────────────┐
+               │  Gemini Flash  │  classify()
+               │  AI Filter     │  Plain-English system prompt
+               │                │  batched, 25 items at a time
+               └───────┬────────┘
+                        │ tier1 (act now) · tier2 (worth knowing)
+                        ▼
+          ┌─────────────────────────────┐
+          │         Delivery            │
+          │  ✉  Email (Gmail SMTP)      │
+          │  ✈  Telegram Bot API        │
+          └─────────────────────────────┘
+```
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Python 3.12, Flask |
+| AI filtering | Google Gemini 2.5 Flash (free tier) |
+| Email | Gmail SMTP via `smtplib` |
+| Telegram | Telegram Bot API |
+| Feed parsing | `feedparser`, `beautifulsoup4`, `requests` |
+| Server | Gunicorn + nginx on Ubuntu 24.04 (Hetzner) |
+| Auth | Session-based login, credentials from `.env` |
+| Config | JSON file, edited live via control panel UI |
+
+---
+
+## Features
+
+- **Web control panel** — dark-mode UI to configure pipelines without touching code
+- **Multi-pipeline** — run separate briefings with different sources, topics, and delivery channels
+- **Multi-channel delivery** — email and Telegram per pipeline, independently toggled
+- **Plain-English AI filtering** — describe what you care about in natural language; Gemini classifies everything into Tier 1 (act today) / Tier 2 (worth knowing) / Tier 3 (skip)
+- **Project context** — paste a project description so the AI filters for what's relevant to your current work
+- **Run history** — last 14 runs visible in the control panel with item counts
+- **Background execution** — "Run now" returns instantly; pipeline runs in a background thread
+
+---
+
+## Setup
+
+### Requirements
+
+- Python 3.10+
+- A Gmail account with an [App Password](https://support.google.com/accounts/answer/185833) enabled
+- A Telegram bot token (from [@BotFather](https://t.me/botfather)) and your chat ID
+- A [Gemini API key](https://aistudio.google.com/) (free tier is sufficient)
+
+### Local development
+
+```bash
+git clone https://github.com/YOUR_USERNAME/ai-intel-pipeline.git
+cd ai-intel-pipeline
+
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install flask python-dotenv feedparser requests beautifulsoup4 google-genai
+
+cp .env.example .env
+# Edit .env with your credentials
+
+python app.py
+# Visit http://localhost:5000
+```
+
+### Server deployment (Ubuntu VPS)
+
+```bash
+# On your server
+sudo apt update && sudo apt install python3 python3-venv nginx -y
+
+mkdir -p /opt/ai-intel && cd /opt/ai-intel
+python3 -m venv venv
+source venv/bin/activate
+pip install flask gunicorn python-dotenv feedparser requests beautifulsoup4 google-genai
+
+# Copy files
+scp app.py pipeline_runner.py user@YOUR_SERVER_IP:/opt/ai-intel/
+cp .env.example /opt/ai-intel/.env
+# Edit .env with real credentials
+
+# Create systemd service (see DEPLOY.md for full config)
+systemctl enable ai-intel
+systemctl start ai-intel
+```
+
+See [`DEPLOY.md`](DEPLOY.md) for the full nginx and systemd configuration.
+
+### Telegram channel format
+
+In the control panel, enter your Telegram channel value as:
+
+```
+BOT_TOKEN:CHAT_ID
+```
+
+where `BOT_TOKEN` is the full token from BotFather (e.g. `7123456789:AAHx...`) and `CHAT_ID` is your numeric chat ID. The pipeline splits on the **last** colon, so the colon inside the bot token is handled correctly.
+
+---
+
+## Screenshots
+
+<!-- Add screenshots here -->
+
+---
+
+## Key design decisions
+
+### Why Gemini free tier instead of OpenAI?
+
+The classification step runs on ~150 items per pipeline per day. At GPT-4o pricing that adds up quickly. Gemini 2.5 Flash handles structured JSON output reliably on the free tier, keeping the running cost at zero for personal use.
+
+### Why RSS over the X (Twitter) API?
+
+The X API's free tier dropped to 1,500 reads/month in 2023 — not enough for daily scanning. Every source in this pipeline is available via RSS or JSON without authentication, making the system free to run and impossible to rate-limit.
+
+### Why Flask instead of Django?
+
+The entire backend fits in two files. Django's ORM, admin, and migrations add complexity with no benefit here — there's no relational data, just a single JSON config file. Flask's minimal surface area also makes the codebase easier to audit and deploy on a fresh VPS in minutes.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
