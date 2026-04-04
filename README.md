@@ -127,7 +127,17 @@ where `BOT_TOKEN` is the full token from BotFather (e.g. `7123456789:AAHx...`) a
 
 ## Screenshots
 
-<!-- Add screenshots here -->
+**Control panel — pipeline configuration**
+![Pipeline config](screenshots/pipeline-config.png)
+
+**Delivery settings — email and Telegram**
+![Delivery settings](screenshots/delivery-settings.png)
+
+**Telegram delivery**
+![Telegram message](screenshots/telegram-delivery.png)
+
+**Email delivery**
+![Email digest](screenshots/email-delivery.png)
 
 ---
 
