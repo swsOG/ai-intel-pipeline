@@ -49,13 +49,53 @@ def test_source_policy_starter_set_is_deterministic():
         "TechCrunch AI": "reporting", "The Verge AI": "reporting",
         "The Batch": "reporting", "GitHub Trending": "discovery",
         "Hacker News AI": "discovery", "Product Hunt": "discovery",
-        "r/MachineLearning": "discovery",
+        "r/MachineLearning": "discovery", "r/LocalLLaMA": "discovery",
+        "r/artificial": "discovery", "ArXiv AI": "primary",
     }
     policies = {f["name"]: f for feeds in pr.SOURCE_FEEDS.values() for f in feeds}
     for name, source_class in expected.items():
         assert policies[name]["source_class"] == source_class
         assert 1 <= policies[name]["trust_weight"] <= 5
         assert policies[name]["rationale"]
+    assert set(policies) == set(expected)
+
+
+def test_normalization_uses_utc_timestamps_and_source_evidence_policy():
+    source = next(feed for feed in pr.SOURCE_FEEDS["RSS Blogs"] if feed["name"] == "OpenAI Blog")
+    item = pr.normalize_item(
+        raw(published="2026-07-16T13:30:00+02:00"),
+        source,
+        fetched_at=datetime(2026, 7, 16, 8, 0),
+    )
+    assert item["published_at"] == "2026-07-16T11:30:00+00:00"
+    assert item["fetched_at"] == "2026-07-16T08:00:00+00:00"
+    assert item["evidence_level"] == "primary"
+    assert item["source_policy"] == {
+        "source_class": "official",
+        "trust_weight": 5,
+        "rationale": "First-party OpenAI announcements.",
+    }
+
+
+def test_reddit_normalizes_destination_and_preserves_discussion_url(monkeypatch):
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"data": {"children": [{"data": {
+        "title": "Linked evidence",
+        "url_overridden_by_dest": "HTTPS://WWW.Example.com/report/?utm_source=reddit&a=1#comments",
+        "url": "https://reddit.com/ignored",
+        "permalink": "/r/LocalLLaMA/comments/abc/linked_evidence/",
+        "created_utc": 1784203200,
+        "selftext": "Discussion",
+        "stickied": False,
+    }}]}}
+    monkeypatch.setattr(pr.requests, "get", lambda *args, **kwargs: response)
+    source = next(feed for feed in pr.SOURCE_FEEDS["Reddit"] if feed["name"] == "r/LocalLLaMA")
+    item = pr.fetch_reddit(source)[0]
+    assert item["url"] == "https://example.com/report?a=1"
+    assert item["discussion_url"] == "https://reddit.com/r/LocalLLaMA/comments/abc/linked_evidence"
+    assert item["published_at"] == "2026-07-16T12:00:00+00:00"
+    assert item["evidence_level"] == "community discovery"
 
 
 def test_canonicalization_and_immutable_stable_id():
@@ -110,6 +150,19 @@ def test_classifier_rejects_unknown_duplicate_and_model_altered_ids():
     assert selected[0]["title"] == one["title"]  # local identity, never model identity
 
 
+@pytest.mark.parametrize("field,bad_value", [
+    ("relevance", -1), ("relevance", 4),
+    ("actionability", -1), ("actionability", 4),
+    ("novelty", -1), ("novelty", 4),
+    ("hype_penalty", -1), ("hype_penalty", 4),
+    ("confidence", -1), ("confidence", 4),
+    ("confidence", True), ("confidence", 2.5),
+])
+def test_signal_range_and_integer_validation_is_independent_of_duplicate_ids(field, bad_value):
+    item = norm("OpenAI Blog", url=f"https://example.com/range/{field}/{bad_value}")
+    assert pr.rank_items([item], [signal(item, **{field: bad_value})])["scored"] == []
+
+
 def test_global_scoring_strict_gates_and_caps():
     items = [norm("OpenAI Blog", f"https://example.com/{i}") for i in range(20)]
     signals = [signal(item) for item in items]
@@ -124,6 +177,48 @@ def test_community_title_only_hype_cannot_be_tier1():
     result = pr.rank_items([community], [signal(community)])
     assert not result["tier1"]
     assert result["tier2"]
+
+
+@pytest.mark.parametrize("source_name,overrides", [
+    ("GitHub Trending", {}),
+    ("OpenAI Blog", {"relevance": 1}),
+    ("OpenAI Blog", {"actionability": 1}),
+    ("OpenAI Blog", {"confidence": 1}),
+    ("OpenAI Blog", {"hype_penalty": 2}),
+])
+def test_each_tier1_gate_independently_blocks_selection(source_name, overrides):
+    item = norm(source_name)
+    result = pr.rank_items([item], [signal(item, **overrides)])
+    assert result["tier1"] == []
+
+
+def test_tier1_score_gate_and_inclusive_signal_boundaries():
+    item = norm("ArXiv AI")
+    item["trust_weight"] = 1
+    rejected = pr.rank_items([item], [signal(
+        item, relevance=2, actionability=2, novelty=0, confidence=2, hype_penalty=1,
+    )])
+    assert rejected["scored"][0]["score"] == 17
+    assert rejected["tier1"] == []
+
+    item["trust_weight"] = 5
+    accepted = pr.rank_items([item], [signal(
+        item, relevance=2, actionability=2, novelty=0, confidence=2, hype_penalty=1,
+    )])
+    assert accepted["scored"][0]["score"] == 29
+    assert accepted["tier1"]
+
+
+@pytest.mark.parametrize("overrides", [
+    {"relevance": 0},
+    {"confidence": 0},
+    {"relevance": 1, "actionability": 0, "novelty": 0, "confidence": 1, "hype_penalty": 3},
+])
+def test_each_tier2_gate_blocks_selection(overrides):
+    item = norm("GitHub Trending")
+    result = pr.rank_items([item], [signal(item, **overrides)])
+    assert result["tier1"] == []
+    assert result["tier2"] == []
 
 
 def test_safe_html_and_telegram_rendering():
@@ -145,6 +240,17 @@ def test_all_batch_failure_raises_instead_of_false_quiet_day():
         pr.classify([item], "prompt", client=FakeClient([RuntimeError("down")]), sleep_seconds=0)
 
 
+def test_all_batches_with_empty_or_invalid_arrays_raise_instead_of_false_quiet_day():
+    one = norm("OpenAI Blog")
+    two = norm("Anthropic Blog", "https://example.com/two")
+    invalid = pr.json.dumps([signal(two, item_id="unknown"), {"item_id": two["item_id"]}])
+    with pytest.raises(pr.ClassificationError, match="no usable validated signals"):
+        pr.classify(
+            [one, two], "prompt", client=FakeClient(["[]", invalid]),
+            batch_size=1, sleep_seconds=0,
+        )
+
+
 def test_dry_run_never_delivers_and_writes_collision_safe_audit(monkeypatch, tmp_path):
     item = norm("OpenAI Blog")
     monkeypatch.setattr(pr, "fetch_all_for_pipeline", lambda pipeline: [item])
@@ -162,6 +268,16 @@ def test_dry_run_never_delivers_and_writes_collision_safe_audit(monkeypatch, tmp
     email.assert_not_called(); telegram.assert_not_called()
     assert first["audit_path"] != second["audit_path"]
     assert first["html"].startswith("<!DOCTYPE html>")
+    with open(first["audit_path"], encoding="utf-8") as handle:
+        audit = pr.json.load(handle)
+    assert audit["pipeline"] == "Trial"
+    assert audit["delivery_enabled"] is False
+    assert audit["total_fetched"] == audit["total_after_filtering"] == 1
+    assert audit["sources_checked"] == 1
+    assert audit["tier1_count"] == 1 and audit["tier2_count"] == 0
+    assert audit["tier1"][0]["item_id"] == item["item_id"]
+    assert audit["tier1"][0]["source_policy"] == item["source_policy"]
+    assert audit["scored"][0]["reason"] == "Directly useful evidence."
 
 
 def test_prompt_has_bounded_id_only_contract_and_personal_interests():

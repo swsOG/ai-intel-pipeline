@@ -327,7 +327,6 @@ def classify(items, system_prompt, client=None, batch_size=25, sleep_seconds=5):
         client = genai.Client(api_key=api_key)
     batches = [items[index:index + batch_size] for index in range(0, len(items), batch_size)]
     all_signals = []
-    successful_batches = 0
     seen = set()
     for index, batch in enumerate(batches):
         payload = [{
@@ -343,7 +342,6 @@ def classify(items, system_prompt, client=None, batch_size=25, sleep_seconds=5):
             values = json.loads(response.text)
             if not isinstance(values, list):
                 raise ValueError("Gemini response must be an array")
-            successful_batches += 1
             known = {item["item_id"] for item in batch}
             for value in values:
                 if _valid_signal(value, known, seen):
@@ -353,8 +351,11 @@ def classify(items, system_prompt, client=None, batch_size=25, sleep_seconds=5):
             print(f"  [ERROR] Gemini batch {index + 1}: {exc}")
         if index < len(batches) - 1 and sleep_seconds:
             time.sleep(sleep_seconds)
-    if batches and successful_batches == 0:
-        raise ClassificationError("All Gemini classification batches failed; briefing not delivered")
+    if batches and not all_signals:
+        raise ClassificationError(
+            "All Gemini classification batches returned no usable validated signals; "
+            "briefing not delivered"
+        )
     return rank_items(items, all_signals)
 
 
