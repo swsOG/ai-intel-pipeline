@@ -181,27 +181,59 @@ class FakeClient:
     def __init__(self, replies):
         self.replies = iter(replies)
         self.models = self
+        self.calls = []
 
     def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
         reply = next(self.replies)
         if isinstance(reply, Exception):
             raise reply
         return SimpleNamespace(text=reply)
 
 
-def test_classifier_rejects_unknown_duplicate_and_model_altered_ids():
+def alias_signal(reference, item, **overrides):
+    return signal(item, item_id=reference, **overrides)
+
+
+def test_classifier_maps_exact_batch_aliases_to_complex_stable_ids_and_hides_hashes():
     one = norm("OpenAI Blog")
     two = norm("Anthropic Blog", "https://example.com/two")
-    malformed = pr.json.dumps([
-        signal(one), signal(one, relevance=0), signal(two, item_id="made-up"), signal(two),
+    assert len(one["item_id"]) == len(two["item_id"]) == 20
+    client = FakeClient([
+        pr.json.dumps([alias_signal("i001", one)]),
+        pr.json.dumps([alias_signal("i001", two)]),
     ])
-    with pytest.raises(pr.ClassificationError, match="malformed"):
-        pr.classify([one, two], "prompt", client=FakeClient([malformed]), sleep_seconds=0)
-
-    clean = pr.json.dumps([signal(one), signal(two)])
-    ranked = pr.classify([one, two], "prompt", client=FakeClient([clean]), sleep_seconds=0)
+    ranked = pr.classify([one, two], "prompt", client=client, batch_size=1, sleep_seconds=0)
     assert [x["item_id"] for x in ranked["tier1"]] == [one["item_id"], two["item_id"]]
     assert ranked["tier1"][0]["title"] == one["title"]  # identity always stays local
+    payloads = [pr.json.loads(call["contents"]) for call in client.calls]
+    assert [[value["item_id"] for value in payload] for payload in payloads] == [["i001"], ["i001"]]
+    for call in client.calls:
+        assert one["item_id"] not in call["contents"]
+        assert two["item_id"] not in call["contents"]
+
+
+@pytest.mark.parametrize("bad_reference", ["i003", "i00l", "I001", "i001 "])
+def test_classifier_rejects_unknown_or_mutated_batch_alias(bad_reference):
+    item = norm("OpenAI Blog")
+    response = pr.json.dumps([alias_signal(bad_reference, item)])
+    with pytest.raises(pr.ClassificationError, match="unknown"):
+        pr.classify([item], "prompt", client=FakeClient([response]), sleep_seconds=0)
+
+
+def test_classifier_rejects_duplicate_and_missing_batch_aliases():
+    one = norm("OpenAI Blog")
+    two = norm("Anthropic Blog", "https://example.com/two")
+    duplicate = pr.json.dumps([
+        alias_signal("i001", one), alias_signal("i001", one, relevance=0),
+        alias_signal("i002", two),
+    ])
+    with pytest.raises(pr.ClassificationError, match="duplicate"):
+        pr.classify([one, two], "prompt", client=FakeClient([duplicate]), sleep_seconds=0)
+
+    missing = pr.json.dumps([alias_signal("i001", one)])
+    with pytest.raises(pr.ClassificationError, match="missing"):
+        pr.classify([one, two], "prompt", client=FakeClient([missing]), sleep_seconds=0)
 
 
 @pytest.mark.parametrize("field,bad_value", [
@@ -293,7 +325,7 @@ def test_all_batch_failure_raises_instead_of_false_quiet_day():
 def test_all_batches_with_empty_or_invalid_arrays_raise_instead_of_false_quiet_day():
     one = norm("OpenAI Blog")
     two = norm("Anthropic Blog", "https://example.com/two")
-    invalid = pr.json.dumps([signal(two, item_id="unknown"), {"item_id": two["item_id"]}])
+    invalid = pr.json.dumps([alias_signal("unknown", two), {"item_id": "i001"}])
     with pytest.raises(pr.ClassificationError, match="missing validated signals"):
         pr.classify(
             [one, two], "prompt", client=FakeClient(["[]", invalid]),
@@ -356,9 +388,9 @@ def test_partial_batch_failure_and_omitted_ids_abort_classification():
     one = norm("OpenAI Blog")
     two = norm("Anthropic Blog", "https://example.com/two")
     with pytest.raises(pr.ClassificationError, match="batch 2"):
-        pr.classify([one, two], "prompt", client=FakeClient([pr.json.dumps([signal(one)]), RuntimeError("down")]), batch_size=1, sleep_seconds=0)
+        pr.classify([one, two], "prompt", client=FakeClient([pr.json.dumps([alias_signal("i001", one)]), RuntimeError("down")]), batch_size=1, sleep_seconds=0)
     with pytest.raises(pr.ClassificationError, match="missing"):
-        pr.classify([one, two], "prompt", client=FakeClient([pr.json.dumps([signal(one)])]), sleep_seconds=0)
+        pr.classify([one, two], "prompt", client=FakeClient([pr.json.dumps([alias_signal("i001", one)])]), sleep_seconds=0)
 
 
 def test_ranking_configuration_and_local_trust_policy_are_validated():

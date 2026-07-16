@@ -396,12 +396,14 @@ def classify(items, system_prompt, client=None, batch_size=25, sleep_seconds=5):
     all_signals = []
     seen = set()
     for index, batch in enumerate(batches):
+        references = {f"i{position:03d}": item["item_id"] for position, item in enumerate(batch, 1)}
         payload = [{
-            "item_id": item["item_id"], "title": item["title"], "summary": item["summary"][:500],
+            "item_id": reference, "title": item["title"], "summary": item["summary"][:500],
             "source": item["source"], "source_class": item["source_class"],
             "evidence_level": item["evidence_level"],
-        } for item in batch]
-        known = {item["item_id"] for item in batch}
+        } for reference, item in zip(references, batch)]
+        known = set(references.values())
+        returned_references = set()
         batch_signals = []
         try:
             response = client.models.generate_content(
@@ -412,11 +414,20 @@ def classify(items, system_prompt, client=None, batch_size=25, sleep_seconds=5):
             if not isinstance(values, list):
                 raise ValueError("Gemini response must be an array")
             for value in values:
-                if not _valid_signal(value, known, seen):
-                    raise ValueError("malformed, unknown, or duplicate signal")
-                seen.add(value["item_id"])
-                batch_signals.append(value)
-            missing = known - {value["item_id"] for value in batch_signals}
+                if not isinstance(value, dict):
+                    raise ValueError("malformed signal")
+                reference = value.get("item_id")
+                if reference not in references:
+                    raise ValueError("unknown model item reference")
+                if reference in returned_references:
+                    raise ValueError("duplicate model item reference")
+                returned_references.add(reference)
+                mapped_value = dict(value, item_id=references[reference])
+                if not _valid_signal(mapped_value, known, seen):
+                    raise ValueError("malformed or duplicate signal")
+                seen.add(mapped_value["item_id"])
+                batch_signals.append(mapped_value)
+            missing = set(references) - returned_references
             if missing:
                 raise ValueError(f"missing validated signals for {len(missing)} item(s)")
         except Exception as exc:
