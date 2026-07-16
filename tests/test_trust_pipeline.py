@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import app as app_module
 import pipeline_runner as pr
 from app import build_system_prompt
 
@@ -507,3 +508,95 @@ def test_delivery_key_lock_is_hashed_and_exclusive_across_processes(tmp_path):
         [sys.executable, "-c", probe, lock_path], check=False
     )
     assert released_after_error.returncode == 0
+
+
+def _successful_delivery_setup(monkeypatch):
+    item = norm("OpenAI Blog")
+    fetch = Mock(return_value=[item])
+    monkeypatch.setattr(pr, "fetch_all_for_pipeline", fetch)
+    monkeypatch.setattr(
+        pr, "classify", lambda items, prompt: pr.rank_items(items, [signal(items[0])])
+    )
+    email = Mock()
+    monkeypatch.setattr(pr, "send_email", email)
+    return fetch, email
+
+
+def test_delivery_identity_separates_same_name_pipeline_ids(monkeypatch, tmp_path):
+    fetch, email = _successful_delivery_setup(monkeypatch)
+    base = {"name": "Duplicate", "sources": ["RSS Blogs"], "channels": {
+        "email": {"on": True, "value": "same@example.com"},
+    }}
+
+    pr.run_single_pipeline({**base, "id": "pipeline-a"}, audit_dir=tmp_path, delivery_key="period-1")
+    pr.run_single_pipeline({**base, "id": "pipeline-b"}, audit_dir=tmp_path, delivery_key="period-1")
+
+    assert fetch.call_count == 2
+    assert email.call_count == 2
+    audits = [pr.json.loads(path.read_text()) for path in tmp_path.glob("*.json")]
+    assert len({record["delivery_identity"] for record in audits}) == 2
+
+
+def test_delivery_success_is_bound_to_normalized_destination(monkeypatch, tmp_path):
+    fetch, email = _successful_delivery_setup(monkeypatch)
+    pipeline = {"id": "stable-id", "name": "Trial", "sources": ["RSS Blogs"], "channels": {
+        "email": {"on": True, "value": " FIRST@example.com "},
+    }}
+
+    first = pr.run_single_pipeline(pipeline, audit_dir=tmp_path, delivery_key="period-1")
+    unchanged = {**pipeline, "channels": {"email": {"on": True, "value": "first@example.com"}}}
+    second = pr.run_single_pipeline(unchanged, audit_dir=tmp_path, delivery_key="period-1")
+    changed = {**pipeline, "channels": {"email": {"on": True, "value": "other@example.com"}}}
+    third = pr.run_single_pipeline(changed, audit_dir=tmp_path, delivery_key="period-1")
+
+    assert first["audit_path"] == second["audit_path"]
+    assert third["audit_path"] != first["audit_path"]
+    assert fetch.call_count == 2
+    assert email.call_count == 2
+    first_audit = pr.json.loads(open(first["audit_path"], encoding="utf-8").read())
+    third_audit = pr.json.loads(open(third["audit_path"], encoding="utf-8").read())
+    assert first_audit["delivery"]["email"]["destination_fingerprint"]
+    assert (first_audit["delivery"]["email"]["destination_fingerprint"] !=
+            third_audit["delivery"]["email"]["destination_fingerprint"])
+
+
+def test_secret_delivery_key_is_only_persisted_as_sha256(monkeypatch, tmp_path):
+    _successful_delivery_setup(monkeypatch)
+    secret_key = "2026-07-16:recipient@example.com:SUPER-SECRET-TOKEN"
+    pipeline = {"id": "safe-id", "name": "Safe", "sources": ["RSS Blogs"], "channels": {
+        "email": {"on": True, "value": "recipient@example.com"},
+    }}
+
+    result = pr.run_single_pipeline(
+        pipeline, audit_dir=tmp_path, delivery_key=secret_key
+    )
+    audit_bytes = open(result["audit_path"], "rb").read()
+    audit = pr.json.loads(audit_bytes)
+
+    assert secret_key.encode() not in audit_bytes
+    assert b"recipient@example.com" not in audit_bytes
+    assert "delivery_key" not in audit
+    assert len(audit["delivery_key_fingerprint"]) == 64
+    assert len(audit["delivery_identity"]) == 64
+
+
+def test_logs_redact_sensitive_fields_from_legacy_audits(monkeypatch, tmp_path):
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    secret_key = "period:recipient@example.com:BOT-TOKEN"
+    (daily / "legacy.json").write_text(pr.json.dumps({
+        "pipeline": "Legacy", "delivery_key": secret_key,
+        "delivery": {"email": {"status": "success", "destination": "recipient@example.com"},
+                     "telegram": {"status": "failed", "token": "BOT-TOKEN"}},
+    }))
+    monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+    client = app_module.app.test_client()
+    with client.session_transaction() as session:
+        session["logged_in"] = True
+
+    response = client.get("/api/logs")
+
+    assert response.status_code == 200
+    assert secret_key.encode() not in response.data
+    assert b"recipient@example.com" not in response.data
+    assert b"BOT-TOKEN" not in response.data

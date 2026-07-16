@@ -554,6 +554,56 @@ def _delivery_lock_path(audit_dir, delivery_key):
     return os.path.join(str(audit_dir), f".delivery-{digest}.lock")
 
 
+def _sha256(value):
+    """Return a stable fingerprint without retaining the source value."""
+    return hashlib.sha256(
+        str(value).encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
+def _destination_fingerprint(channel, value):
+    """Fingerprint the effective, normalized channel destination."""
+    normalized = str(value or "").strip()
+    if channel == "email":
+        normalized = normalized.lower()
+    elif channel == "telegram" and ":" in normalized:
+        token, chat_id = normalized.rsplit(":", 1)
+        normalized = f"{token.strip()}:{chat_id.strip()}"
+    return _sha256(f"{channel}:{normalized}")
+
+
+def _delivery_fingerprints(pipeline, delivery_key):
+    """Build opaque identities for one pipeline, period, and destination set."""
+    pipeline_id = pipeline.get("id")
+    if pipeline_id is not None and str(pipeline_id).strip():
+        pipeline_source = {"id": str(pipeline_id).strip()}
+    else:
+        # Compatibility for callers with pre-id pipeline configurations.
+        pipeline_source = {
+            key: value for key, value in pipeline.items() if key != "channels"
+        }
+    pipeline_fingerprint = _sha256(json.dumps(
+        pipeline_source, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ))
+    key_fingerprint = _sha256(delivery_key)
+    destinations = {}
+    for channel in ("email", "telegram"):
+        config = pipeline.get("channels", {}).get(channel, {})
+        if config.get("on") and config.get("value"):
+            destinations[channel] = _destination_fingerprint(channel, config["value"])
+    identity_source = json.dumps({
+        "pipeline": pipeline_fingerprint,
+        "delivery_key": key_fingerprint,
+        "destinations": destinations,
+    }, sort_keys=True, separators=(",", ":"))
+    return {
+        "pipeline_fingerprint": pipeline_fingerprint,
+        "delivery_key_fingerprint": key_fingerprint,
+        "destination_fingerprints": destinations,
+        "delivery_identity": _sha256(identity_source),
+    }
+
+
 @contextmanager
 def _delivery_lock(audit_dir, delivery_key):
     """Exclusively claim one delivery key across Linux processes."""
@@ -587,8 +637,8 @@ def _sanitized_delivery_error(channel, exc):
     return error
 
 
-def _prior_audit(audit_dir, pipeline_name, delivery_key):
-    if not delivery_key or not os.path.isdir(audit_dir):
+def _prior_audit(audit_dir, delivery_identity):
+    if not delivery_identity or not os.path.isdir(audit_dir):
         return None, None
     for filename in os.listdir(audit_dir):
         if not filename.endswith(".json"):
@@ -597,17 +647,21 @@ def _prior_audit(audit_dir, pipeline_name, delivery_key):
         try:
             with open(path, encoding="utf-8") as handle:
                 record = json.load(handle)
-            if record.get("pipeline") == pipeline_name and record.get("delivery_key") == delivery_key:
+            if record.get("delivery_identity") == delivery_identity:
                 return path, record
         except (OSError, ValueError, TypeError):
             continue
     return None, None
 
 
-def _write_audit(audit_dir, pipeline, fetched_count, filtered, classified, deliver, delivery_key=None):
+def _write_audit(audit_dir, pipeline, fetched_count, filtered, classified, deliver,
+                 fingerprints=None):
     os.makedirs(audit_dir, exist_ok=True)
     now = datetime.now(timezone.utc)
-    prior_path, prior = _prior_audit(audit_dir, pipeline.get("name", ""), delivery_key) if deliver else (None, None)
+    fingerprints = fingerprints or {}
+    prior_path, prior = _prior_audit(
+        audit_dir, fingerprints.get("delivery_identity")
+    ) if deliver else (None, None)
     path = prior_path or os.path.join(
         str(audit_dir), f"{now.strftime('%Y%m%dT%H%M%S.%fZ')}-{uuid.uuid4().hex[:10]}.json"
     )
@@ -616,21 +670,27 @@ def _write_audit(audit_dir, pipeline, fetched_count, filtered, classified, deliv
     channels = pipeline.get("channels", {})
     for channel in ("email", "telegram"):
         configured = bool(channels.get(channel, {}).get("on") and channels.get(channel, {}).get("value"))
+        destination_fingerprint = fingerprints.get("destination_fingerprints", {}).get(channel)
         old = prior_delivery.get(channel, {})
-        if deliver and old.get("status") == "success":
+        same_destination = old.get("destination_fingerprint") == destination_fingerprint
+        if deliver and same_destination and old.get("status") == "success":
             delivery[channel] = old
-        elif deliver and configured and old.get("status") in {"attempting", "ambiguous"}:
+        elif (deliver and configured and same_destination and
+              old.get("status") in {"attempting", "ambiguous"}):
             # The process may have died after the provider accepted the message.
             # Avoid a blind resend when the external outcome cannot be known.
             delivery[channel] = {
                 "status": "ambiguous", "updated_at": now.isoformat(),
+                "destination_fingerprint": destination_fingerprint,
             }
         elif deliver and configured:
-            delivery[channel] = {"status": "pending"}
+            delivery[channel] = {
+                "status": "pending", "destination_fingerprint": destination_fingerprint,
+            }
         else:
             delivery[channel] = {"status": "dry_run" if not deliver and configured else "not_configured"}
     if prior:
-        # A delivery key identifies one immutable briefing. Retrying a failed
+        # A delivery identity identifies one immutable briefing. Retrying a failed
         # channel must not combine newly fetched content with channels that
         # already received the original briefing.
         record = dict(prior)
@@ -639,7 +699,10 @@ def _write_audit(audit_dir, pipeline, fetched_count, filtered, classified, deliv
     else:
         record = {
             "run_at": now.isoformat(), "pipeline": pipeline.get("name", ""),
-            "delivery_enabled": deliver, "delivery_key": delivery_key, "delivery": delivery,
+            "delivery_enabled": deliver, "delivery": delivery,
+            "pipeline_fingerprint": fingerprints.get("pipeline_fingerprint"),
+            "delivery_key_fingerprint": fingerprints.get("delivery_key_fingerprint"),
+            "delivery_identity": fingerprints.get("delivery_identity"),
             "total_fetched": fetched_count, "total_after_filtering": len(filtered),
             "sources_checked": len(pipeline.get("sources", [])),
             "tier1_count": len(classified.get("tier1", [])),
@@ -658,9 +721,12 @@ def _run_single_pipeline_locked(pipeline, deliver=True, audit_dir=None, delivery
     directory = audit_dir or os.path.join(os.path.dirname(__file__), "data", "daily")
     if deliver and delivery_key is None:
         period = datetime.now(timezone.utc).date().isoformat()
-        delivery_key = f"{pipeline.get('name', '')}:{period}"
+        delivery_key = period
+    fingerprints = _delivery_fingerprints(pipeline, delivery_key) if deliver else {}
 
-    _, prior = _prior_audit(directory, pipeline.get("name", ""), delivery_key) if deliver else (None, None)
+    _, prior = _prior_audit(
+        directory, fingerprints.get("delivery_identity")
+    ) if deliver else (None, None)
     if prior:
         # Retry directly from the immutable audited payload. Feed or model
         # availability must not prevent retrying a channel that previously failed.
@@ -669,7 +735,8 @@ def _run_single_pipeline_locked(pipeline, deliver=True, audit_dir=None, delivery
             "scored": prior.get("scored", []),
         }
         audit_path, audit = _write_audit(
-            directory, pipeline, prior.get("total_fetched", 0), [], classified, True, delivery_key
+            directory, pipeline, prior.get("total_fetched", 0), [], classified, True,
+            fingerprints,
         )
     else:
         fetched = fetch_all_for_pipeline(pipeline)
@@ -680,7 +747,7 @@ def _run_single_pipeline_locked(pipeline, deliver=True, audit_dir=None, delivery
             return {"status": "no_items", "message": "No fresh valid items"}
         classified = classify(filtered, build_system_prompt(pipeline))
         audit_path, audit = _write_audit(
-            directory, pipeline, len(fetched), filtered, classified, deliver, delivery_key
+            directory, pipeline, len(fetched), filtered, classified, deliver, fingerprints
         )
 
     delivery_classified = {
@@ -706,17 +773,20 @@ def _run_single_pipeline_locked(pipeline, deliver=True, audit_dir=None, delivery
                 continue
             # This durable marker closes the crash window before an external call.
             audit["delivery"][channel] = {
-                "status": "attempting", "updated_at": datetime.now(timezone.utc).isoformat()
+                "status": "attempting", "updated_at": datetime.now(timezone.utc).isoformat(),
+                "destination_fingerprint": fingerprints["destination_fingerprints"][channel],
             }
             _save_audit(audit_path, audit)
             try:
                 sender(config["value"])
                 audit["delivery"][channel] = {
-                    "status": "success", "updated_at": datetime.now(timezone.utc).isoformat()
+                    "status": "success", "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "destination_fingerprint": fingerprints["destination_fingerprints"][channel],
                 }
             except Exception as exc:
                 audit["delivery"][channel] = {
                     "status": "failed", "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "destination_fingerprint": fingerprints["destination_fingerprints"][channel],
                     "error": _sanitized_delivery_error(channel, exc),
                 }
                 failures.append(channel)
@@ -745,8 +815,9 @@ def run_single_pipeline(pipeline, deliver=True, audit_dir=None, delivery_key=Non
     directory = audit_dir or os.path.join(os.path.dirname(__file__), "data", "daily")
     if deliver and delivery_key is None:
         period = datetime.now(timezone.utc).date().isoformat()
-        delivery_key = f"{pipeline.get('name', '')}:{period}"
+        delivery_key = period
     if not deliver:
         return _run_single_pipeline_locked(pipeline, False, directory, delivery_key)
-    with _delivery_lock(directory, delivery_key):
+    delivery_identity = _delivery_fingerprints(pipeline, delivery_key)["delivery_identity"]
+    with _delivery_lock(directory, delivery_identity):
         return _run_single_pipeline_locked(pipeline, True, directory, delivery_key)

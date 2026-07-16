@@ -206,11 +206,28 @@ def get_logs():
             if f.endswith(".json"):
                 with open(os.path.join(daily_dir, f)) as fh:
                     try:
-                        data = json.load(fh)
+                        data = _redact_log_secrets(json.load(fh))
                         logs.append({"date": f.replace(".json", ""), "data": data})
                     except json.JSONDecodeError:
                         pass
     return jsonify(logs)
+
+
+def _redact_log_secrets(value):
+    """Remove raw legacy delivery credentials before returning audit data."""
+    sensitive = {
+        "delivery_key", "destination", "recipient", "token", "chat_id",
+        "config_value", "webhook", "webhook_url",
+    }
+    if isinstance(value, dict):
+        return {
+            key: _redact_log_secrets(item)
+            for key, item in value.items()
+            if key.lower() not in sensitive
+        }
+    if isinstance(value, list):
+        return [_redact_log_secrets(item) for item in value]
+    return value
 
 
 @app.route("/health")
