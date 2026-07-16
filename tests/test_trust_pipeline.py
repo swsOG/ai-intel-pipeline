@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -78,9 +79,7 @@ def test_normalization_uses_utc_timestamps_and_source_evidence_policy():
 
 
 def test_reddit_normalizes_destination_and_preserves_discussion_url(monkeypatch):
-    response = Mock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = {"data": {"children": [{"data": {
+    payload = {"data": {"children": [{"data": {
         "title": "Linked evidence",
         "url_overridden_by_dest": "HTTPS://WWW.Example.com/report/?utm_source=reddit&a=1#comments",
         "url": "https://reddit.com/ignored",
@@ -89,20 +88,25 @@ def test_reddit_normalizes_destination_and_preserves_discussion_url(monkeypatch)
         "selftext": "Discussion",
         "stickied": False,
     }}]}}
+    response = Mock(headers={})
+    response.raise_for_status.return_value = None
+    response.iter_content.return_value = [pr.json.dumps(payload).encode()]
     monkeypatch.setattr(pr.requests, "get", lambda *args, **kwargs: response)
     source = next(feed for feed in pr.SOURCE_FEEDS["Reddit"] if feed["name"] == "r/LocalLLaMA")
     item = pr.fetch_reddit(source)[0]
-    assert item["url"] == "https://example.com/report?a=1"
-    assert item["discussion_url"] == "https://reddit.com/r/LocalLLaMA/comments/abc/linked_evidence"
+    assert item["url"] == "HTTPS://WWW.Example.com/report/?utm_source=reddit&a=1#comments"
+    assert item["discussion_url"] == "https://reddit.com/r/LocalLLaMA/comments/abc/linked_evidence/"
     assert item["published_at"] == "2026-07-16T12:00:00+00:00"
     assert item["evidence_level"] == "community discovery"
 
 
 def test_canonicalization_and_immutable_stable_id():
     a = "HTTPS://WWW.Example.com:443/path/?utm_source=x&b=2&a=1#frag"
-    b = "https://example.com/path?a=1&b=2"
-    assert pr.canonicalize_url(a) == pr.canonicalize_url(b)
-    assert pr.stable_item_id(a) == pr.stable_item_id(b)
+    tracked_variant = "https://www.example.com:443/path/?b=2&a=1"
+    semantic_variant = "https://example.com/path?a=1&b=2"
+    assert pr.canonicalize_url(a) == tracked_variant
+    assert pr.stable_item_id(a) == pr.stable_item_id(tracked_variant)
+    assert pr.stable_item_id(a) != pr.stable_item_id(semantic_variant)
     assert pr.canonicalize_url("javascript:alert(1)") == ""
 
 
@@ -140,14 +144,16 @@ class FakeClient:
 def test_classifier_rejects_unknown_duplicate_and_model_altered_ids():
     one = norm("OpenAI Blog")
     two = norm("Anthropic Blog", "https://example.com/two")
-    reply = pr.json.dumps([
-        signal(one), signal(one, relevance=0), signal(two, item_id="made-up"),
-        signal(two), {**signal(two), "relevance": 4},
+    malformed = pr.json.dumps([
+        signal(one), signal(one, relevance=0), signal(two, item_id="made-up"), signal(two),
     ])
-    ranked = pr.classify([one, two], "prompt", client=FakeClient([reply]), sleep_seconds=0)
-    selected = ranked["tier1"]
-    assert [x["item_id"] for x in selected] == [one["item_id"], two["item_id"]]
-    assert selected[0]["title"] == one["title"]  # local identity, never model identity
+    with pytest.raises(pr.ClassificationError, match="malformed"):
+        pr.classify([one, two], "prompt", client=FakeClient([malformed]), sleep_seconds=0)
+
+    clean = pr.json.dumps([signal(one), signal(two)])
+    ranked = pr.classify([one, two], "prompt", client=FakeClient([clean]), sleep_seconds=0)
+    assert [x["item_id"] for x in ranked["tier1"]] == [one["item_id"], two["item_id"]]
+    assert ranked["tier1"][0]["title"] == one["title"]  # identity always stays local
 
 
 @pytest.mark.parametrize("field,bad_value", [
@@ -194,14 +200,10 @@ def test_each_tier1_gate_independently_blocks_selection(source_name, overrides):
 
 def test_tier1_score_gate_and_inclusive_signal_boundaries():
     item = norm("ArXiv AI")
-    item["trust_weight"] = 1
-    rejected = pr.rank_items([item], [signal(
-        item, relevance=2, actionability=2, novelty=0, confidence=2, hype_penalty=1,
-    )])
-    assert rejected["scored"][0]["score"] == 17
-    assert rejected["tier1"] == []
+    tampered = dict(item, trust_weight=1)
+    rejected = pr.rank_items([tampered], [signal(tampered)])
+    assert rejected["scored"] == []
 
-    item["trust_weight"] = 5
     accepted = pr.rank_items([item], [signal(
         item, relevance=2, actionability=2, novelty=0, confidence=2, hype_penalty=1,
     )])
@@ -244,7 +246,7 @@ def test_all_batches_with_empty_or_invalid_arrays_raise_instead_of_false_quiet_d
     one = norm("OpenAI Blog")
     two = norm("Anthropic Blog", "https://example.com/two")
     invalid = pr.json.dumps([signal(two, item_id="unknown"), {"item_id": two["item_id"]}])
-    with pytest.raises(pr.ClassificationError, match="no usable validated signals"):
+    with pytest.raises(pr.ClassificationError, match="missing validated signals"):
         pr.classify(
             [one, two], "prompt", client=FakeClient(["[]", invalid]),
             batch_size=1, sleep_seconds=0,
@@ -286,3 +288,132 @@ def test_prompt_has_bounded_id_only_contract_and_personal_interests():
                  "tool use", "orchestration", "evaluation", "AI coding", "anti-hype"):
         assert text.lower() in prompt.lower()
     assert '"title"' not in prompt.split("Respond ONLY", 1)[-1]
+
+
+def test_arxiv_feed_uses_https():
+    assert pr.SOURCE_FEEDS["ArXiv"][0]["url"] == "https://arxiv.org/rss/cs.AI"
+
+
+def test_canonical_identity_preserves_url_semantics_and_delivery_url():
+    url = "HTTPS://WWW.Example.com/path/?ref=first&b=2&a=1&a=0&source=x&utm_medium=no#section"
+    assert pr.canonicalize_url(url) == "https://www.example.com/path/?ref=first&b=2&a=1&a=0&source=x"
+    item = norm("OpenAI Blog", url=url)
+    assert item["url"] == url
+    assert item["item_id"] == pr.stable_item_id(url)
+    assert pr.stable_item_id("https://www.example.com/path/?ref=first&b=2&a=1&a=0&source=x") == item["item_id"]
+    assert pr.stable_item_id("https://example.com/path?b=2&a=0&a=1&source=x&ref=first") != item["item_id"]
+
+
+def test_partial_batch_failure_and_omitted_ids_abort_classification():
+    one = norm("OpenAI Blog")
+    two = norm("Anthropic Blog", "https://example.com/two")
+    with pytest.raises(pr.ClassificationError, match="batch 2"):
+        pr.classify([one, two], "prompt", client=FakeClient([pr.json.dumps([signal(one)]), RuntimeError("down")]), batch_size=1, sleep_seconds=0)
+    with pytest.raises(pr.ClassificationError, match="missing"):
+        pr.classify([one, two], "prompt", client=FakeClient([pr.json.dumps([signal(one)])]), sleep_seconds=0)
+
+
+def test_ranking_configuration_and_local_trust_policy_are_validated():
+    item = norm("OpenAI Blog")
+    escalated = dict(item, trust_weight=1, source_class="discovery")
+    assert pr.rank_items([escalated], [signal(escalated)])["scored"] == []
+    for kwargs in ({"tier1_cap": -1}, {"tier2_cap": 101}):
+        with pytest.raises(ValueError):
+            pr.rank_items([item], [signal(item)], **kwargs)
+    with pytest.raises(ValueError):
+        pr.classify([item], "prompt", client=FakeClient([]), batch_size=0, sleep_seconds=0)
+
+
+def test_unreasonable_future_timestamp_is_filtered():
+    future = norm("OpenAI Blog", published=(NOW + timedelta(days=2)).isoformat())
+    assert pr.filter_and_dedupe([future], now=NOW) == []
+
+
+class TagBalanceParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"b", "i", "a"}:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        assert self.stack and self.stack.pop() == tag
+
+
+def test_long_telegram_is_structurally_bounded_with_complete_entities():
+    items = []
+    for index in range(15):
+        item = norm("OpenAI Blog", f"https://example.com/{index}?a=1&b=2", title=("A & <title> " * 100))
+        item.update(signal(item, reason="R & <reason> " * 100, action="Do & <action> " * 100))
+        items.append(item)
+    message = pr.build_telegram_message({"tier1": items[:5], "tier2": items[5:]}, now=NOW)
+    assert len(message) <= 4000
+    assert not message.endswith(("&", "&a", "&am", "&amp", "&#"))
+    parser = TagBalanceParser()
+    parser.feed(message)
+    parser.close()
+    assert parser.stack == []
+
+
+def test_rss_uses_timeout_bounded_content_and_oversize_is_rejected(monkeypatch):
+    response = Mock(headers={"Content-Length": str(pr.MAX_RESPONSE_BYTES + 1)})
+    response.raise_for_status.return_value = None
+    get = Mock(return_value=response)
+    monkeypatch.setattr(pr.requests, "get", get)
+    source = pr.SOURCE_FEEDS["ArXiv"][0]
+    assert pr.fetch_rss(source) == []
+    assert get.call_args.kwargs["timeout"] == pr.REQUEST_TIMEOUT
+    assert get.call_args.kwargs["stream"] is True
+    response.close.assert_called_once()
+    response.json.assert_not_called()
+
+    streamed = Mock(headers={})
+    streamed.raise_for_status.return_value = None
+    streamed.iter_content.return_value = [b"x" * pr.MAX_RESPONSE_BYTES, b"x"]
+    monkeypatch.setattr(pr.requests, "get", Mock(return_value=streamed))
+    with pytest.raises(ValueError, match="exceeds"):
+        pr._get_bounded(source["url"])
+    streamed.close.assert_called_once()
+
+
+def test_delivery_audit_records_each_channel_and_retry_skips_success(monkeypatch, tmp_path):
+    item = norm("OpenAI Blog")
+    pipeline = {"name": "Trial", "sources": ["RSS Blogs"], "channels": {
+        "email": {"on": True, "value": "x@example.com"},
+        "telegram": {"on": True, "value": "token:123"},
+    }}
+    fetched_runs = iter(([item], []))
+    monkeypatch.setattr(pr, "fetch_all_for_pipeline", lambda pipeline: next(fetched_runs))
+    monkeypatch.setattr(
+        pr, "classify", lambda items, prompt: pr.rank_items(items, [signal(items[0])])
+    )
+    observed = []
+    telegram_item_ids = []
+
+    def email_sender(*args):
+        audit_files = list(tmp_path.glob("*.json"))
+        assert len(audit_files) == 1
+        with audit_files[0].open(encoding="utf-8") as handle:
+            observed.append(pr.json.load(handle)["delivery"]["email"]["status"])
+
+    def telegram_sender(classified, config):
+        # A retry must deliver the same audited briefing, not newly fetched content.
+        telegram_item_ids.append(classified["tier1"][0]["item_id"])
+        raise RuntimeError("telegram down")
+
+    email, telegram = Mock(side_effect=email_sender), Mock(side_effect=telegram_sender)
+    monkeypatch.setattr(pr, "send_email", email)
+    monkeypatch.setattr(pr, "send_telegram", telegram)
+    for _ in range(2):
+        with pytest.raises(pr.DeliveryError) as error:
+            pr.run_single_pipeline(pipeline, audit_dir=tmp_path, delivery_key="trial-2026-07-16")
+        with open(error.value.audit_path, encoding="utf-8") as handle:
+            audit = pr.json.load(handle)
+        assert audit["delivery"]["email"]["status"] == "success"
+        assert audit["delivery"]["telegram"]["status"] == "failed"
+    email.assert_called_once()
+    assert telegram.call_count == 2
+    assert telegram_item_ids == [item["item_id"], item["item_id"]]
+    assert observed == ["pending"]
