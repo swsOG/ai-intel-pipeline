@@ -1,6 +1,6 @@
 # AI Intel Pipeline
 
-A self-hosted AI intelligence briefing system that scans 15+ sources daily, filters with Gemini AI, and delivers a ranked digest to your email and Telegram — configured through a web control panel.
+A self-hosted AI intelligence briefing system that scans 15 active feeds daily, filters with Gemini AI, and delivers a ranked digest to your email and Telegram — configured through a web control panel. Three additional high-value publishers are retained in policy as explicitly web-only references and are not claimed as monitored feeds.
 
 ---
 
@@ -8,15 +8,15 @@ A self-hosted AI intelligence briefing system that scans 15+ sources daily, filt
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     Sources (15+)                       │
-│  RSS Blogs · GitHub Trending · Hacker News · Reddit     │
+│                  Active feeds (15)                      │
+│  RSS/Atom · GitHub Trending · Hacker News · Reddit Atom │
 │  Product Hunt · Hugging Face · TechCrunch · The Verge   │
 └───────────────────────┬─────────────────────────────────┘
                         │ raw items (~150/run)
                         ▼
                ┌────────────────┐
                │    Fetcher     │  pipeline_runner.py
-               │  RSS / JSON /  │  fetch_rss(), fetch_reddit(),
+               │  RSS / Atom /  │  fetch_rss(),
                │  HTML scrape   │  fetch_github()
                └───────┬────────┘
                         │ canonical IDs · timestamps · source/evidence policy
@@ -150,7 +150,7 @@ The classification step runs on ~150 items per pipeline per day. At GPT-4o prici
 
 ### Why RSS over the X (Twitter) API?
 
-The X API's free tier dropped to 1,500 reads/month in 2023 — not enough for daily scanning. Every source in this pipeline is available via RSS or JSON without authentication, making the system free to run and impossible to rate-limit.
+The X API's free tier is not suitable for this daily scan. Active feed sources use unauthenticated RSS/Atom (including Reddit subreddit Atom feeds) or a bounded HTML collector. Anthropic News, the Meta AI Blog, and The Batch currently have no working RSS endpoints, so they remain in the source-policy registry as `web_only` canonical pages and are skipped rather than silently producing fetch errors. Feed hosts can still rate-limit or become unavailable.
 
 ### Why Flask instead of Django?
 

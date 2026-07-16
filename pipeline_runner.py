@@ -20,10 +20,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _source(name, url, kind, source_class, trust_weight, rationale):
+def _source(name, url, kind, source_class, trust_weight, rationale, **metadata):
     return {
         "name": name, "url": url, "type": kind, "source_class": source_class,
-        "trust_weight": trust_weight, "rationale": rationale,
+        "trust_weight": trust_weight, "rationale": rationale, **metadata,
     }
 
 
@@ -31,19 +31,19 @@ def _source(name, url, kind, source_class, trust_weight, rationale):
 # URL is inferred or generated at runtime.
 SOURCE_FEEDS = {
     "RSS Blogs": [
-        _source("Anthropic Blog", "https://www.anthropic.com/rss.xml", "rss", "official", 5, "First-party Anthropic announcements."),
+        _source("Anthropic Blog", "https://www.anthropic.com/news", "web_only", "official", 5, "First-party Anthropic announcements; canonical web page only because no working RSS feed is currently available."),
         _source("OpenAI Blog", "https://openai.com/blog/rss.xml", "rss", "official", 5, "First-party OpenAI announcements."),
         _source("Google AI Blog", "https://blog.google/technology/ai/rss/", "rss", "official", 5, "First-party Google AI announcements."),
-        _source("Meta AI Blog", "https://ai.meta.com/blog/rss/", "rss", "official", 5, "First-party Meta AI announcements."),
+        _source("Meta AI Blog", "https://ai.meta.com/blog/", "web_only", "official", 5, "First-party Meta AI announcements; canonical web page only because no working RSS feed is currently available."),
         _source("Simon Willison", "https://simonwillison.net/atom/everything/", "rss", "expert", 4, "Named practitioner's technical analysis."),
-        _source("The Batch", "https://www.deeplearning.ai/the-batch/feed/", "rss", "reporting", 3, "Edited secondary AI reporting."),
+        _source("The Batch", "https://www.deeplearning.ai/the-batch/", "web_only", "reporting", 3, "Edited secondary AI reporting; canonical web page only because no working RSS feed is currently available."),
         _source("Lilian Weng", "https://lilianweng.github.io/index.xml", "rss", "expert", 4, "Named researcher's technical analysis."),
         _source("Ars Technica AI", "https://arstechnica.com/ai/feed/", "rss", "reporting", 3, "Edited technology reporting."),
     ],
     "Reddit": [
-        _source("r/MachineLearning", "https://www.reddit.com/r/MachineLearning/hot.json?limit=10", "reddit", "discovery", 1, "Community discussion; verify linked claims."),
-        _source("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/hot.json?limit=10", "reddit", "discovery", 1, "Community discussion; verify linked claims."),
-        _source("r/artificial", "https://www.reddit.com/r/artificial/hot.json?limit=10", "reddit", "discovery", 1, "Community discussion; verify linked claims."),
+        _source("r/MachineLearning", "https://www.reddit.com/r/MachineLearning/.rss", "rss", "discovery", 1, "Community discussion discovered through Reddit Atom; verify linked claims.", discussion_feed=True),
+        _source("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/.rss", "rss", "discovery", 1, "Community discussion discovered through Reddit Atom; verify linked claims.", discussion_feed=True),
+        _source("r/artificial", "https://www.reddit.com/r/artificial/.rss", "rss", "discovery", 1, "Community discussion discovered through Reddit Atom; verify linked claims.", discussion_feed=True),
     ],
     "GitHub Trending": [_source("GitHub Trending", "https://github.com/trending?since=daily", "github", "discovery", 1, "Popularity-based repository discovery, not verification.")],
     "Hacker News": [_source("Hacker News AI", "https://hnrss.org/newest?q=AI+OR+LLM+OR+GPT&points=50", "rss", "discovery", 1, "Community popularity-based discovery.")],
@@ -122,7 +122,9 @@ def canonicalize_url(url):
 
 def stable_item_id(url):
     canonical = canonicalize_url(url)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
+    # 80 bits keeps model round trips manageable while retaining ample collision
+    # resistance for this local feed corpus. Identity is still derived locally.
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20] if canonical else ""
 
 
 def _iso_timestamp(value):
@@ -208,35 +210,31 @@ def fetch_rss(source):
         feed = feedparser.parse(content)
         result = []
         for entry in feed.entries[:15]:
-            summary = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text()[:300]
+            raw_summary = entry.get("summary", "")
+            if entry.get("content"):
+                raw_summary = entry["content"][0].get("value", raw_summary)
+            summary_soup = BeautifulSoup(raw_summary, "html.parser")
+            summary = summary_soup.get_text()[:300]
+            link = entry.get("link", "")
+            discussion_url = ""
+            if source.get("discussion_feed"):
+                discussion_url = link
+                # Reddit Atom labels the external destination '[link]'. Self-posts
+                # intentionally fall back to the Reddit discussion URL.
+                destination = next((
+                    anchor.get("href", "") for anchor in summary_soup.find_all("a")
+                    if anchor.get_text(" ", strip=True).lower() == "[link]"
+                    and _safe_delivery_url(anchor.get("href", ""))
+                ), "")
+                link = destination or discussion_url
             result.append(normalize_item({
-                "title": entry.get("title", "Untitled"), "url": entry.get("link", ""),
+                "title": entry.get("title", "Untitled"), "url": link,
                 "summary": summary.strip(), "published_at": _date_from_feed(entry),
+                "discussion_url": discussion_url,
             }, source))
         return result
     except Exception as exc:
         print(f"  [ERROR] RSS: {source['name']}: {exc}")
-        return []
-
-
-def fetch_reddit(source):
-    try:
-        content = _get_bounded(source["url"])
-        result = []
-        for post in json.loads(content).get("data", {}).get("children", []):
-            value = post.get("data", {})
-            if value.get("stickied"):
-                continue
-            discussion = f"https://reddit.com{value.get('permalink', '')}"
-            target = value.get("url_overridden_by_dest") or value.get("url") or discussion
-            result.append(normalize_item({
-                "title": value.get("title", "Untitled"), "url": target,
-                "summary": (value.get("selftext") or "")[:300].strip(),
-                "published_at": value.get("created_utc"), "discussion_url": discussion,
-            }, source))
-        return result
-    except Exception as exc:
-        print(f"  [ERROR] Reddit: {source['name']}: {exc}")
         return []
 
 
@@ -266,8 +264,11 @@ def fetch_all_for_pipeline(pipeline):
     items = []
     for key in pipeline.get("sources", []):
         for source in SOURCE_FEEDS.get(key, []):
+            if source["type"] == "web_only":
+                print(f"  Skipping web-only source: {source['name']}")
+                continue
             print(f"  Fetching: {source['name']}...")
-            fetcher = {"rss": fetch_rss, "reddit": fetch_reddit, "github": fetch_github}.get(source["type"])
+            fetcher = {"rss": fetch_rss, "github": fetch_github}.get(source["type"])
             fetched = fetcher(source) if fetcher else []
             print(f"    -> {len(fetched)} items")
             items.extend(fetched)

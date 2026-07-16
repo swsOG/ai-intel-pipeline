@@ -82,26 +82,37 @@ def test_normalization_uses_utc_timestamps_and_source_evidence_policy():
     }
 
 
-def test_reddit_normalizes_destination_and_preserves_discussion_url(monkeypatch):
-    payload = {"data": {"children": [{"data": {
-        "title": "Linked evidence",
-        "url_overridden_by_dest": "HTTPS://WWW.Example.com/report/?utm_source=reddit&a=1#comments",
-        "url": "https://reddit.com/ignored",
-        "permalink": "/r/LocalLLaMA/comments/abc/linked_evidence/",
-        "created_utc": 1784203200,
-        "selftext": "Discussion",
-        "stickied": False,
-    }}]}}
-    response = Mock(headers={})
-    response.raise_for_status.return_value = None
-    response.iter_content.return_value = [pr.json.dumps(payload).encode()]
-    monkeypatch.setattr(pr.requests, "get", lambda *args, **kwargs: response)
+def test_reddit_atom_normalizes_destination_and_preserves_discussion_url(monkeypatch):
+    atom = b'''<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <title>r/LocalLLaMA</title>
+      <entry>
+        <title>Linked evidence</title>
+        <link href="https://www.reddit.com/r/LocalLLaMA/comments/abc/linked_evidence/" />
+        <updated>2026-07-16T12:00:00+00:00</updated>
+        <content type="html">&lt;span&gt;&lt;a href="HTTPS://WWW.Example.com/report/?utm_source=reddit&amp;amp;a=1#comments"&gt;[link]&lt;/a&gt;&lt;/span&gt; &lt;a href="https://www.reddit.com/r/LocalLLaMA/comments/abc/linked_evidence/"&gt;[comments]&lt;/a&gt;</content>
+      </entry>
+    </feed>'''
+    bounded = Mock(return_value=atom)
+    monkeypatch.setattr(pr, "_get_bounded", bounded)
     source = next(feed for feed in pr.SOURCE_FEEDS["Reddit"] if feed["name"] == "r/LocalLLaMA")
-    item = pr.fetch_reddit(source)[0]
+    item = pr.fetch_rss(source)[0]
+    bounded.assert_called_once_with("https://www.reddit.com/r/LocalLLaMA/.rss")
     assert item["url"] == "HTTPS://WWW.Example.com/report/?utm_source=reddit&a=1#comments"
-    assert item["discussion_url"] == "https://reddit.com/r/LocalLLaMA/comments/abc/linked_evidence/"
+    assert item["discussion_url"] == "https://www.reddit.com/r/LocalLLaMA/comments/abc/linked_evidence/"
     assert item["published_at"] == "2026-07-16T12:00:00+00:00"
     assert item["evidence_level"] == "community discovery"
+
+
+def test_reddit_sources_are_atom_rss_and_use_bounded_rss_collector(monkeypatch):
+    sources = pr.SOURCE_FEEDS["Reddit"]
+    assert all(source["type"] == "rss" for source in sources)
+    assert all(source["url"] == f"https://www.reddit.com/{source['name']}/.rss" for source in sources)
+    rss = Mock(return_value=[])
+    monkeypatch.setattr(pr, "fetch_rss", rss)
+    assert not hasattr(pr, "fetch_reddit")
+    pr.fetch_all_for_pipeline({"sources": ["Reddit"]})
+    assert [call.args[0] for call in rss.call_args_list] == sources
 
 
 def test_canonicalization_and_immutable_stable_id():
@@ -111,7 +122,40 @@ def test_canonicalization_and_immutable_stable_id():
     assert pr.canonicalize_url(a) == tracked_variant
     assert pr.stable_item_id(a) == pr.stable_item_id(tracked_variant)
     assert pr.stable_item_id(a) != pr.stable_item_id(semantic_variant)
+    assert pr.stable_item_id(a) == pr.hashlib.sha256(tracked_variant.encode()).hexdigest()[:20]
+    assert len(pr.stable_item_id(a)) == 20
+    assert all(character in "0123456789abcdef" for character in pr.stable_item_id(a))
     assert pr.canonicalize_url("javascript:alert(1)") == ""
+
+
+def test_short_item_ids_remain_distinct_for_distinct_canonical_urls():
+    urls = [f"https://example.com/releases/{index}" for index in range(1000)]
+    item_ids = [pr.stable_item_id(url) for url in urls]
+    assert len(set(item_ids)) == len(urls)
+    assert max(map(len, item_ids)) == 20
+
+
+def test_web_only_high_value_sources_remain_in_policy_but_are_not_fetched(monkeypatch):
+    expected = {
+        "Anthropic Blog": "https://www.anthropic.com/news",
+        "Meta AI Blog": "https://ai.meta.com/blog/",
+        "The Batch": "https://www.deeplearning.ai/the-batch/",
+    }
+    registry = {source["name"]: source for source in pr.SOURCE_FEEDS["RSS Blogs"]}
+    for name, url in expected.items():
+        source = registry[name]
+        assert source["url"] == url
+        assert source["type"] == "web_only"
+        assert source["rationale"] and source["trust_weight"] >= 3
+
+    rss = Mock(return_value=[])
+    monkeypatch.setattr(pr, "fetch_rss", rss)
+    pr.fetch_all_for_pipeline({"sources": ["RSS Blogs"]})
+    fetched_names = [call.args[0]["name"] for call in rss.call_args_list]
+    assert not set(expected) & set(fetched_names)
+    assert set(fetched_names) == {
+        source["name"] for source in pr.SOURCE_FEEDS["RSS Blogs"] if source["type"] == "rss"
+    }
 
 
 def test_freshness_invalid_filter_and_undated_item():
