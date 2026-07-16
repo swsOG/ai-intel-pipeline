@@ -19,14 +19,14 @@ A self-hosted AI intelligence briefing system that scans 15+ sources daily, filt
                │  RSS / JSON /  │  fetch_rss(), fetch_reddit(),
                │  HTML scrape   │  fetch_github()
                └───────┬────────┘
-                        │ normalised {title, url, summary, source}
+                        │ canonical IDs · timestamps · source/evidence policy
                         ▼
                ┌────────────────┐
                │  Gemini Flash  │  classify()
-               │  AI Filter     │  Plain-English system prompt
+               │ Signal Assessor│  Bounded relevance/action/hype signals
                │                │  batched, 25 items at a time
                └───────┬────────┘
-                        │ tier1 (act now) · tier2 (worth knowing)
+                        │ local deterministic ranking and strict tier caps
                         ▼
           ┌─────────────────────────────┐
           │         Delivery            │
@@ -57,7 +57,8 @@ A self-hosted AI intelligence briefing system that scans 15+ sources daily, filt
 - **Web control panel** — dark-mode UI to configure pipelines without touching code
 - **Multi-pipeline** — run separate briefings with different sources, topics, and delivery channels
 - **Multi-channel delivery** — email and Telegram per pipeline, independently toggled
-- **Plain-English AI filtering** — describe what you care about in natural language; Gemini classifies everything into Tier 1 (act today) / Tier 2 (worth knowing) / Tier 3 (skip)
+- **Trustworthy filtering** — canonicalises, freshness-filters, and deduplicates items while preferring primary evidence; Gemini supplies bounded signals and local code computes the final capped ranking
+- **Safe trial runs** — `run_single_pipeline(pipeline, deliver=False)` renders and writes a collision-safe audit record without sending email or Telegram
 - **Project context** — paste a project description so the AI filters for what's relevant to your current work
 - **Run history** — last 14 runs visible in the control panel with item counts
 - **Background execution** — "Run now" returns instantly; pipeline runs in a background thread
@@ -81,7 +82,7 @@ cd ai-intel-pipeline
 
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install flask python-dotenv feedparser requests beautifulsoup4 google-genai
+pip install -r requirements.txt
 
 cp .env.example .env
 # Edit .env with your credentials
