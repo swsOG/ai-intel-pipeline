@@ -1,5 +1,6 @@
 """Fetch, filter, rank, render, and optionally deliver AI intelligence."""
 
+import fcntl
 import hashlib
 import html
 import json
@@ -7,6 +8,7 @@ import os
 import smtplib
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -545,6 +547,46 @@ def _save_audit(path, record):
     os.replace(temp_path, path)
 
 
+def _delivery_lock_path(audit_dir, delivery_key):
+    """Return a secret-safe, deterministic path for a delivery claim lock."""
+    identity = str(delivery_key).encode("utf-8", errors="surrogatepass")
+    digest = hashlib.sha256(identity).hexdigest()
+    return os.path.join(str(audit_dir), f".delivery-{digest}.lock")
+
+
+@contextmanager
+def _delivery_lock(audit_dir, delivery_key):
+    """Exclusively claim one delivery key across Linux processes."""
+    os.makedirs(audit_dir, exist_ok=True)
+    path = _delivery_lock_path(audit_dir, delivery_key)
+    with open(path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield path
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _sanitized_delivery_error(channel, exc):
+    """Describe a delivery failure without persisting exception text or URLs."""
+    error = {"channel": channel}
+    if isinstance(exc, requests.HTTPError):
+        error["category"] = "http_error"
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            error["http_status"] = status
+    elif isinstance(exc, requests.Timeout):
+        error["category"] = "timeout"
+    elif isinstance(exc, requests.ConnectionError):
+        error["category"] = "connection_error"
+    elif isinstance(exc, (ValueError, TypeError)):
+        error["category"] = "configuration_error"
+    else:
+        error["category"] = "delivery_error"
+    return error
+
+
 def _prior_audit(audit_dir, pipeline_name, delivery_key):
     if not delivery_key or not os.path.isdir(audit_dir):
         return None, None
@@ -577,6 +619,12 @@ def _write_audit(audit_dir, pipeline, fetched_count, filtered, classified, deliv
         old = prior_delivery.get(channel, {})
         if deliver and old.get("status") == "success":
             delivery[channel] = old
+        elif deliver and configured and old.get("status") in {"attempting", "ambiguous"}:
+            # The process may have died after the provider accepted the message.
+            # Avoid a blind resend when the external outcome cannot be known.
+            delivery[channel] = {
+                "status": "ambiguous", "updated_at": now.isoformat(),
+            }
         elif deliver and configured:
             delivery[channel] = {"status": "pending"}
         else:
@@ -603,8 +651,8 @@ def _write_audit(audit_dir, pipeline, fetched_count, filtered, classified, deliv
     return path, record
 
 
-def run_single_pipeline(pipeline, deliver=True, audit_dir=None, delivery_key=None):
-    """Run, audit, and optionally deliver with per-channel idempotency."""
+def _run_single_pipeline_locked(pipeline, deliver=True, audit_dir=None, delivery_key=None):
+    """Run while the caller holds the delivery-key lock when delivering."""
     from app import build_system_prompt
     started = time.time()
     directory = audit_dir or os.path.join(os.path.dirname(__file__), "data", "daily")
@@ -654,8 +702,13 @@ def run_single_pipeline(pipeline, deliver=True, audit_dir=None, delivery_key=Non
             config = channels.get(channel, {})
             if not (config.get("on") and config.get("value")):
                 continue
-            if audit["delivery"][channel]["status"] == "success":
+            if audit["delivery"][channel]["status"] in {"success", "ambiguous"}:
                 continue
+            # This durable marker closes the crash window before an external call.
+            audit["delivery"][channel] = {
+                "status": "attempting", "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            _save_audit(audit_path, audit)
             try:
                 sender(config["value"])
                 audit["delivery"][channel] = {
@@ -664,16 +717,36 @@ def run_single_pipeline(pipeline, deliver=True, audit_dir=None, delivery_key=Non
             except Exception as exc:
                 audit["delivery"][channel] = {
                     "status": "failed", "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "error": str(exc)[:500],
+                    "error": _sanitized_delivery_error(channel, exc),
                 }
                 failures.append(channel)
             _save_audit(audit_path, audit)
     if failures:
         raise DeliveryError(f"Delivery failed for: {', '.join(failures)}", audit_path)
-    return {
+    result = {
         "total_fetched": audit.get("total_fetched", 0),
         "total_filtered": audit.get("total_after_filtering", 0),
         "tier1": len(delivery_classified["tier1"]), "tier2": len(delivery_classified["tier2"]),
         "elapsed": round(time.time() - started, 1), "delivered": deliver,
         "audit_path": audit_path, "html": content if not deliver else None,
     }
+    ambiguous = [
+        channel for channel, state in audit.get("delivery", {}).items()
+        if state.get("status") == "ambiguous"
+    ]
+    if ambiguous:
+        result["status"] = "ambiguous"
+        result["ambiguous_channels"] = ambiguous
+    return result
+
+
+def run_single_pipeline(pipeline, deliver=True, audit_dir=None, delivery_key=None):
+    """Run, audit, and optionally deliver with a cross-process idempotency claim."""
+    directory = audit_dir or os.path.join(os.path.dirname(__file__), "data", "daily")
+    if deliver and delivery_key is None:
+        period = datetime.now(timezone.utc).date().isoformat()
+        delivery_key = f"{pipeline.get('name', '')}:{period}"
+    if not deliver:
+        return _run_single_pipeline_locked(pipeline, False, directory, delivery_key)
+    with _delivery_lock(directory, delivery_key):
+        return _run_single_pipeline_locked(pipeline, True, directory, delivery_key)

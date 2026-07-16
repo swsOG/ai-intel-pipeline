@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -416,4 +419,91 @@ def test_delivery_audit_records_each_channel_and_retry_skips_success(monkeypatch
     email.assert_called_once()
     assert telegram.call_count == 2
     assert telegram_item_ids == [item["item_id"], item["item_id"]]
-    assert observed == ["pending"]
+    assert observed == ["attempting"]
+
+
+def test_delivery_audit_sanitizes_token_bearing_http_errors(monkeypatch, tmp_path):
+    item = norm("OpenAI Blog")
+    token = "123456:SUPER-SECRET-TOKEN"
+    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    pipeline = {"name": "Secret-safe", "sources": ["RSS Blogs"], "channels": {
+        "telegram": {"on": True, "value": f"{token}:-100123"},
+    }}
+    monkeypatch.setattr(pr, "fetch_all_for_pipeline", lambda pipeline: [item])
+    monkeypatch.setattr(
+        pr, "classify", lambda items, prompt: pr.rank_items(items, [signal(items[0])])
+    )
+    response = pr.requests.Response()
+    response.status_code = 502
+    response.request = pr.requests.Request("POST", api_url).prepare()
+    exception = pr.requests.HTTPError(
+        f"502 Server Error for url: {api_url}", response=response
+    )
+    monkeypatch.setattr(pr, "send_telegram", Mock(side_effect=exception))
+
+    with pytest.raises(pr.DeliveryError) as error:
+        pr.run_single_pipeline(pipeline, audit_dir=tmp_path, delivery_key="secret-safe")
+
+    with open(error.value.audit_path, encoding="utf-8") as handle:
+        audit_text = handle.read()
+    audit = pr.json.loads(audit_text)
+    assert token not in audit_text
+    assert api_url not in audit_text
+    assert audit["delivery"]["telegram"]["error"] == {
+        "channel": "telegram", "category": "http_error", "http_status": 502,
+    }
+
+
+def test_attempting_delivery_is_ambiguous_on_retry_and_is_not_resent(monkeypatch, tmp_path):
+    item = norm("OpenAI Blog")
+    pipeline = {"name": "Crash-safe", "sources": ["RSS Blogs"], "channels": {
+        "email": {"on": True, "value": "recipient@example.com"},
+    }}
+    monkeypatch.setattr(pr, "fetch_all_for_pipeline", lambda pipeline: [item])
+    monkeypatch.setattr(
+        pr, "classify", lambda items, prompt: pr.rank_items(items, [signal(items[0])])
+    )
+    crashing_sender = Mock(side_effect=KeyboardInterrupt("simulated process death"))
+    monkeypatch.setattr(pr, "send_email", crashing_sender)
+
+    with pytest.raises(KeyboardInterrupt):
+        pr.run_single_pipeline(pipeline, audit_dir=tmp_path, delivery_key="crash-key")
+    audit_path = next(tmp_path.glob("*.json"))
+    assert pr.json.loads(audit_path.read_text())["delivery"]["email"]["status"] == "attempting"
+
+    replacement_sender = Mock()
+    monkeypatch.setattr(pr, "send_email", replacement_sender)
+    result = pr.run_single_pipeline(pipeline, audit_dir=tmp_path, delivery_key="crash-key")
+
+    replacement_sender.assert_not_called()
+    assert result["status"] == "ambiguous"
+    assert result["ambiguous_channels"] == ["email"]
+    assert pr.json.loads(audit_path.read_text())["delivery"]["email"]["status"] == "ambiguous"
+
+
+def test_delivery_key_lock_is_hashed_and_exclusive_across_processes(tmp_path):
+    secret_key = "recipient@example.com:123456:BOT-TOKEN"
+    lock_path = pr._delivery_lock_path(tmp_path, secret_key)
+    assert secret_key not in os.path.basename(lock_path)
+    assert "recipient" not in os.path.basename(lock_path)
+    probe = (
+        "import fcntl, sys; "
+        "f = open(sys.argv[1], 'a+'); "
+        "\ntry: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError: raise SystemExit(2)"
+        "\nraise SystemExit(0)"
+    )
+
+    with pr._delivery_lock(tmp_path, secret_key):
+        held = subprocess.run([sys.executable, "-c", probe, lock_path], check=False)
+        assert held.returncode == 2
+    released = subprocess.run([sys.executable, "-c", probe, lock_path], check=False)
+    assert released.returncode == 0
+
+    with pytest.raises(RuntimeError, match="inside claim"):
+        with pr._delivery_lock(tmp_path, secret_key):
+            raise RuntimeError("inside claim")
+    released_after_error = subprocess.run(
+        [sys.executable, "-c", probe, lock_path], check=False
+    )
+    assert released_after_error.returncode == 0
