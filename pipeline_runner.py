@@ -493,31 +493,96 @@ def _label(item):
 
 def build_email_html(classified, total_fetched, sources_count):
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
-
-    def rows(items, actionable):
-        output = ""
-        for item in items:
-            title = html.escape(str(item.get("title", "")))
-            url = _safe_url(item.get("url", ""))
-            title_markup = f'<a href="{html.escape(url, quote=True)}" style="font-weight:600;color:#1A1A2E;text-decoration:none;">{title}</a>' if url else f"<strong>{title}</strong>"
-            action = html.escape(str(item.get("action", "")))
-            action_markup = f'<br/><span style="color:#0B53CC;font-weight:600;">→ {action}</span>' if actionable and action else ""
-            output += (
-                '<tr><td style="padding:10px 16px;border-bottom:1px solid #F0F0F0;">'
-                f'{title_markup}<br/><span style="font-size:11px;color:#777;">{html.escape(str(item.get("source", "")))} · {html.escape(_label(item))}</span><br/>'
-                f'<span style="font-size:13px;color:#444;">{html.escape(str(item.get("reason", "")))}</span>{action_markup}</td></tr>'
-            )
-        return output
-
     tier1 = classified.get("tier1", [])
     tier2 = classified.get("tier2", [])
-    t1 = rows(tier1, True) or '<tr><td style="padding:12px 16px;color:#999;">Quiet day. Nothing passed the action gate.</td></tr>'
-    t2 = rows(tier2, False) or '<tr><td style="padding:12px 16px;color:#999;">Nothing notable.</td></tr>'
-    return f'''<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;background:#F5F5F5;font-family:Arial,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:auto;background:#FFF;"><tr><td style="padding:20px 16px;border-bottom:3px solid #0B53CC;"><strong style="font-size:20px;color:#0B53CC;">AI Intel</strong> <span style="color:#777;">{today}</span><br/><small>{total_fetched} scanned · {len(tier1)} act now · {len(tier2)} worth knowing · {sources_count} source groups</small></td></tr>
-<tr><td style="padding:14px 16px 4px;color:#0B53CC;"><strong>ACT NOW</strong></td></tr>{t1}
-<tr><td style="padding:16px 16px 4px;color:#777;"><strong>WORTH KNOWING</strong></td></tr>{t2}
-</table></body></html>'''
+
+    def stat(value, label, accent="#0B53CC"):
+        return (
+            '<td style="padding:0 8px 8px 0;">'
+            '<table cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E6EAF0;border-radius:14px;background:#FFFFFF;">'
+            f'<tr><td style="padding:10px 12px;"><div style="font-size:18px;line-height:22px;font-weight:700;color:{accent};">{value}</div>'
+            f'<div style="font-size:11px;line-height:14px;color:#667085;text-transform:uppercase;letter-spacing:.04em;">{html.escape(label)}</div></td></tr>'
+            '</table></td>'
+        )
+
+    def card(item, index, actionable):
+        title = html.escape(str(item.get("title", "")))
+        url = _safe_url(item.get("url", ""))
+        title_markup = (
+            f'<a href="{html.escape(url, quote=True)}" style="color:#101828;text-decoration:none;font-weight:700;">{title}</a>'
+            if url else f'<span style="color:#101828;font-weight:700;">{title}</span>'
+        )
+        source = html.escape(str(item.get("source", "")))
+        label = html.escape(_label(item))
+        evidence = html.escape(str(item.get("evidence_level", "")))
+        reason = html.escape(str(item.get("reason", "")))
+        action = html.escape(str(item.get("action", "")))
+        score = html.escape(str(item.get("score", "")))
+        action_block = ""
+        if actionable and action:
+            action_block = (
+                '<tr><td style="padding-top:12px;">'
+                '<div style="font-size:11px;line-height:14px;color:#0B53CC;text-transform:uppercase;letter-spacing:.08em;font-weight:700;">Action</div>'
+                f'<div style="font-size:14px;line-height:21px;color:#101828;font-weight:600;">{action}</div>'
+                '</td></tr>'
+            )
+        return (
+            '<table width="100%" cellpadding="0" cellspacing="0" role="presentation" '
+            'style="margin:0 0 12px 0;border:1px solid #E6EAF0;border-radius:16px;background:#FFFFFF;">'
+            '<tr><td style="padding:16px 16px 14px 16px;">'
+            '<table width="100%" cellpadding="0" cellspacing="0" role="presentation"><tr>'
+            f'<td width="34" valign="top"><div style="width:26px;height:26px;border-radius:999px;background:#EEF4FF;color:#0B53CC;text-align:center;font-size:13px;line-height:26px;font-weight:700;">{index}</div></td>'
+            '<td valign="top">'
+            f'<div style="font-size:16px;line-height:22px;margin-bottom:6px;">{title_markup}</div>'
+            f'<div style="font-size:12px;line-height:16px;color:#667085;margin-bottom:12px;">{source} · {label} · Evidence: {evidence} · Score: {score}</div>'
+            '<table width="100%" cellpadding="0" cellspacing="0" role="presentation">'
+            '<tr><td>'
+            '<div style="font-size:11px;line-height:14px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:700;">Why it matters</div>'
+            f'<div style="font-size:14px;line-height:21px;color:#344054;">{reason}</div>'
+            '</td></tr>'
+            f'{action_block}'
+            '</table></td></tr></table></td></tr></table>'
+        )
+
+    def cards(items, actionable):
+        if not items:
+            message = "Quiet day. Nothing passed the action gate." if actionable else "Nothing notable."
+            return (
+                '<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px dashed #D0D5DD;border-radius:16px;background:#FFFFFF;">'
+                f'<tr><td style="padding:16px;color:#667085;font-size:14px;line-height:21px;">{message}</td></tr></table>'
+            )
+        return "".join(card(item, index, actionable) for index, item in enumerate(items, 1))
+
+    return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#F6F8FB;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#101828;">
+<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#F6F8FB;"><tr><td align="center" style="padding:24px 12px;">
+<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="max-width:680px;margin:0 auto;">
+<tr><td style="padding:22px 22px 18px 22px;background:#101828;border-radius:18px;color:#FFFFFF;">
+<div style="font-size:12px;line-height:16px;color:#98A2B3;text-transform:uppercase;letter-spacing:.10em;font-weight:700;">Filip AI Intelligence</div>
+<div style="font-size:28px;line-height:34px;font-weight:750;margin-top:6px;">Weekly briefing</div>
+<div style="font-size:14px;line-height:21px;color:#D0D5DD;margin-top:6px;">{today}</div>
+<div style="font-size:13px;line-height:19px;color:#98A2B3;margin-top:10px;">{total_fetched} scanned · {len(tier1)} act now · {len(tier2)} worth knowing · {sources_count} source groups</div>
+</td></tr>
+<tr><td style="padding:16px 0 4px 0;">
+<table cellpadding="0" cellspacing="0" role="presentation"><tr>
+{stat(total_fetched, "scanned")}{stat(len(tier1), "act now", "#D92D20")}{stat(len(tier2), "worth knowing", "#0B53CC")}{stat(sources_count, "source groups", "#475467")}
+</tr></table>
+</td></tr>
+<tr><td style="padding:12px 0 14px 0;">
+<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E6EAF0;border-radius:16px;background:#FFFFFF;">
+<tr><td style="padding:16px;">
+<div style="font-size:13px;line-height:18px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:700;">Executive brief</div>
+<div style="font-size:15px;line-height:23px;color:#344054;margin-top:6px;">Start with <strong style="color:#101828;">ACT NOW</strong>. Those are the only items with enough evidence and practical value to deserve attention this week. Treat <strong style="color:#101828;">WORTH KNOWING</strong> as context, not tasks.</div>
+</td></tr></table>
+</td></tr>
+<tr><td style="padding:10px 0 8px 0;"><div style="font-size:13px;line-height:18px;color:#D92D20;text-transform:uppercase;letter-spacing:.10em;font-weight:800;">ACT NOW</div></td></tr>
+<tr><td>{cards(tier1, True)}</td></tr>
+<tr><td style="padding:18px 0 8px 0;"><div style="font-size:13px;line-height:18px;color:#475467;text-transform:uppercase;letter-spacing:.10em;font-weight:800;">WORTH KNOWING</div></td></tr>
+<tr><td>{cards(tier2, False)}</td></tr>
+<tr><td style="padding:14px 2px 0 2px;color:#98A2B3;font-size:12px;line-height:18px;">Evidence labels distinguish official/primary sources from expert analysis, reporting, and community discovery. Rankings are deterministic after model scoring.</td></tr>
+</table>
+</td></tr></table>
+</body></html>'''
 
 
 def build_telegram_message(classified, now=None):

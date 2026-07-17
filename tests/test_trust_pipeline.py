@@ -367,6 +367,23 @@ def test_safe_html_and_telegram_rendering():
     assert "official · trust 5/5" in html
 
 
+def test_email_html_uses_clean_briefing_layout():
+    act = norm("OpenAI Blog", title="Major agent reliability release")
+    act.update(signal(act, reason="Adds concrete eval hooks for production agents.", action="Test the eval hook in Hermes."))
+    know = norm("Simon Willison", url="https://example.com/simon", title="Useful prompt injection note")
+    know.update(signal(know, reason="Good context for hardening tool use.", action="Review later."))
+    html = pr.build_email_html({"tier1": [act], "tier2": [know]}, 22, 4)
+    for text in (
+        "Executive brief", "ACT NOW", "WORTH KNOWING", "Why it matters",
+        "Action", "Evidence", "22 scanned", "1 act now", "1 worth knowing",
+        "OpenAI Blog", "Simon Willison",
+    ):
+        assert text in html
+    assert html.index("Executive brief") < html.index("ACT NOW") < html.index("WORTH KNOWING")
+    assert html.count("border-radius:16px") >= 2
+    assert "max-width:680px" in html
+
+
 def test_all_batch_failure_raises_instead_of_false_quiet_day():
     item = norm("OpenAI Blog")
     with pytest.raises(pr.ClassificationError):
