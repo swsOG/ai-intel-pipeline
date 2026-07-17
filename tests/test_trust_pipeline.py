@@ -39,7 +39,7 @@ def signal(item, **overrides):
         "hype_penalty": 0,
         "confidence": 3,
         "reason": "Directly useful evidence.",
-        "action": "Read the release notes.",
+        "action": "Test the release in a sandbox.",
     }
     value.update(overrides)
     return value
@@ -250,11 +250,20 @@ def test_signal_range_and_integer_validation_is_independent_of_duplicate_ids(fie
 
 
 def test_global_scoring_strict_gates_and_caps():
-    items = [norm("OpenAI Blog", f"https://example.com/{i}") for i in range(20)]
+    source_names = [
+        "OpenAI Blog", "Google AI Blog", "Hugging Face Blog", "Simon Willison",
+        "Lilian Weng", "Ars Technica AI", "TechCrunch AI", "The Verge AI",
+        "GitHub Trending", "Hacker News AI", "Product Hunt", "r/LocalLLaMA",
+        "r/MachineLearning", "r/artificial",
+    ]
+    items = [
+        norm(source_name, f"https://example.com/{index}")
+        for index, source_name in enumerate(source_names)
+    ]
     signals = [signal(item) for item in items]
     result = pr.rank_items(items, signals)
     assert len(result["tier1"]) == 5
-    assert len(result["tier2"]) == 10
+    assert len(result["tier2"]) == 9
     assert result["tier1"][0]["score"] >= result["tier1"][-1]["score"]
 
 
@@ -263,6 +272,19 @@ def test_community_title_only_hype_cannot_be_tier1():
     result = pr.rank_items([community], [signal(community)])
     assert not result["tier1"]
     assert result["tier2"]
+
+
+@pytest.mark.parametrize("passive_action", [
+    "Read the release notes.",
+    "Prioritize reading this paper.",
+    "Study the methodology.",
+    "Review the vulnerability details.",
+])
+def test_passive_actions_cannot_be_act_now(passive_action):
+    item = norm("OpenAI Blog")
+    result = pr.rank_items([item], [signal(item, action=passive_action)])
+    assert result["tier1"] == []
+    assert result["tier2"] == result["scored"][:1]
 
 
 @pytest.mark.parametrize("source_name,overrides", [
@@ -279,7 +301,7 @@ def test_each_tier1_gate_independently_blocks_selection(source_name, overrides):
 
 
 def test_tier1_score_gate_and_inclusive_signal_boundaries():
-    item = norm("ArXiv AI")
+    item = norm("OpenAI Blog")
     tampered = dict(item, trust_weight=1)
     rejected = pr.rank_items([tampered], [signal(tampered)])
     assert rejected["scored"] == []
@@ -289,6 +311,35 @@ def test_tier1_score_gate_and_inclusive_signal_boundaries():
     )])
     assert accepted["scored"][0]["score"] == 29
     assert accepted["tier1"]
+
+
+def test_primary_research_needs_stronger_action_signal_for_act_now():
+    paper = norm("ArXiv AI")
+    weak = pr.rank_items([paper], [signal(
+        paper, relevance=2, actionability=2, novelty=0, confidence=2, hype_penalty=1,
+        action="Read the paper.",
+    )])
+    assert weak["scored"][0]["score"] == 29
+    assert weak["tier1"] == []
+    assert weak["tier2"] == weak["scored"][:1]
+
+    strong = pr.rank_items([paper], [signal(
+        paper, relevance=3, actionability=3, novelty=3, confidence=3, hype_penalty=0,
+        action="Test the evaluation harness against Filip's agent workflow.",
+    )])
+    assert strong["tier1"] == [strong["scored"][0]]
+
+
+def test_tiers_apply_source_diversity_caps():
+    official_items = [norm("OpenAI Blog", f"https://example.com/openai/{i}") for i in range(5)]
+    expert_items = [norm("Simon Willison", f"https://example.com/simon/{i}") for i in range(4)]
+    result = pr.rank_items(official_items + expert_items, [
+        signal(item, relevance=3, actionability=3, novelty=3, confidence=3, hype_penalty=0)
+        for item in official_items + expert_items
+    ])
+    assert len(result["tier1"]) == 4
+    assert sum(item["source"] == "OpenAI Blog" for item in result["tier1"]) == 2
+    assert sum(item["source"] == "Simon Willison" for item in result["tier1"]) == 2
 
 
 @pytest.mark.parametrize("overrides", [

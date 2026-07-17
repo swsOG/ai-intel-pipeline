@@ -343,6 +343,52 @@ def _valid_signal(value, known_ids, seen):
     return isinstance(value.get("reason"), str) and isinstance(value.get("action"), str)
 
 
+def _concrete_action(action):
+    """Return whether an action goes beyond passive reading/monitoring."""
+    value = str(action or "").strip().lower()
+    if not value:
+        return False
+    passive_starts = (
+        "read ", "skim ", "review ", "study ", "monitor ", "watch ", "track ",
+        "look into ", "check out ", "keep an eye ", "be aware ",
+        "prioritize reading ", "prioritise reading ",
+        "prioritize reviewing ", "prioritise reviewing ",
+    )
+    return not value.startswith(passive_starts)
+
+
+def _tier1_eligible(item):
+    if not (
+        item["source_class"] != "discovery" and item["relevance"] >= 2
+        and item["actionability"] >= 2 and item["confidence"] >= 2
+        and item["hype_penalty"] <= 1 and item["score"] >= 25
+        and _concrete_action(item.get("action"))
+    ):
+        return False
+    if item["source_class"] == "primary":
+        # Research papers are easy to over-rank as "Act now". Require a
+        # genuinely strong signal before promoting them above "Worth knowing".
+        return (
+            item["relevance"] == 3 and item["actionability"] == 3
+            and item["confidence"] == 3 and item["hype_penalty"] == 0
+        )
+    return True
+
+
+def _select_diverse(items, cap, max_per_source=2):
+    selected = []
+    source_counts = {}
+    for item in items:
+        source = item.get("source", "")
+        if source_counts.get(source, 0) >= max_per_source:
+            continue
+        selected.append(item)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if len(selected) >= cap:
+            break
+    return selected
+
+
 def rank_items(items, signals, tier1_cap=5, tier2_cap=10):
     """Attach validated model signals, then rank globally using local policy."""
     for name, cap in (("tier1_cap", tier1_cap), ("tier2_cap", tier2_cap)):
@@ -368,17 +414,14 @@ def rank_items(items, signals, tier1_cap=5, tier2_cap=10):
         scored.append(item)
     scored.sort(key=lambda value: (-value["score"], -value["trust_weight"], value["item_id"]))
 
-    tier1_candidates = [item for item in scored if (
-        item["source_class"] != "discovery" and item["relevance"] >= 2
-        and item["actionability"] >= 2 and item["confidence"] >= 2
-        and item["hype_penalty"] <= 1 and item["score"] >= 25
-    )]
-    tier1 = tier1_candidates[:tier1_cap]
+    tier1_candidates = [item for item in scored if _tier1_eligible(item)]
+    tier1 = _select_diverse(tier1_candidates, tier1_cap)
     used = {item["item_id"] for item in tier1}
-    tier2 = [item for item in scored if (
+    tier2_candidates = [item for item in scored if (
         item["item_id"] not in used and item["relevance"] >= 1
         and item["confidence"] >= 1 and item["score"] >= 10
-    )][:tier2_cap]
+    )]
+    tier2 = _select_diverse(tier2_candidates, tier2_cap)
     return {"tier1": tier1, "tier2": tier2, "scored": scored}
 
 
