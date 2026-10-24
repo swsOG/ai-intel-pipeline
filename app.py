@@ -98,13 +98,29 @@ body {
 </html>"""
 
 
+_PLACEHOLDER_PASSWORDS = {"", "changeme", "change_this_to_your_password", "password", "admin"}
+
+
+def _admin_credentials_ok(username: str, password: str) -> bool:
+    """Check the control-panel login against ADMIN_USERNAME / ADMIN_PASSWORD.
+
+    There is no built-in default: if ADMIN_PASSWORD is unset or still a placeholder,
+    every login is refused, so a forgotten .env can never expose the panel.
+    """
+    expected_user = os.getenv("ADMIN_USERNAME", "").strip()
+    expected_pass = os.getenv("ADMIN_PASSWORD", "")
+    if not expected_user or expected_pass.strip().lower() in _PLACEHOLDER_PASSWORDS:
+        return False
+    return secrets.compare_digest(username, expected_user) and secrets.compare_digest(password, expected_pass)
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
     if request.method == "POST":
         u = request.form.get("username", "")
         p = request.form.get("password", "")
-        if u == os.getenv("ADMIN_USERNAME", "admin") and p == os.getenv("ADMIN_PASSWORD", "changeme"):
+        if _admin_credentials_ok(u, p):
             session["logged_in"] = True
             return redirect(url_for("dashboard"))
         error = "Invalid credentials"
