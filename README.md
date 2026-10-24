@@ -1,6 +1,8 @@
 # AI Intel Pipeline
 
-A self-hosted AI intelligence briefing system that scans 15 active feeds daily, filters with Gemini AI, and delivers a ranked digest to your email and Telegram — configured through a web control panel. Three additional high-value publishers are retained in policy as explicitly web-only references and are not claimed as monitored feeds.
+A self-hosted briefing system that turns a noisy stream of AI news into a short, ranked digest. It pulls from 15 feeds, uses Gemini to assess each item, applies local trust and freshness rules, and delivers the top picks by email and Telegram. Everything is configured through a web control panel.
+
+> **Status:** ran as a weekly Monday briefing on an Ubuntu server in July 2026, then paused in August. In its July runs it cut 145 to 175 fetched items down to 15 picks (5 "act now", 10 "worth knowing"). 66 automated tests.
 
 ---
 
@@ -46,7 +48,7 @@ A self-hosted AI intelligence briefing system that scans 15 active feeds daily, 
 | Email | Gmail SMTP via `smtplib` |
 | Telegram | Telegram Bot API |
 | Feed parsing | `feedparser`, `beautifulsoup4`, `requests` |
-| Server | Gunicorn + nginx on Ubuntu 24.04 (Hetzner) |
+| Server | Gunicorn + nginx on Ubuntu 24.04 (ran on a Hetzner VPS) |
 | Auth | Session-based login, credentials from `.env` |
 | Config | JSON file, edited live via control panel UI |
 
@@ -54,14 +56,14 @@ A self-hosted AI intelligence briefing system that scans 15 active feeds daily, 
 
 ## Features
 
-- **Web control panel** — dark-mode UI to configure pipelines without touching code
-- **Multi-pipeline** — run separate briefings with different sources, topics, and delivery channels
-- **Multi-channel delivery** — email and Telegram per pipeline, independently toggled
-- **Trustworthy filtering** — canonicalises, freshness-filters, and deduplicates items while preferring primary evidence; Gemini supplies bounded signals and local code computes the final capped ranking
-- **Safe trial runs** — `run_single_pipeline(pipeline, deliver=False)` renders and writes a collision-safe audit record without sending email or Telegram
-- **Project context** — paste a project description so the AI filters for what's relevant to your current work
-- **Run history** — last 14 runs visible in the control panel with item counts
-- **Background execution** — "Run now" returns instantly; pipeline runs in a background thread
+- **Web control panel**: dark-mode UI to configure pipelines without touching code
+- **Multi-pipeline**: run separate briefings with different sources, topics, and delivery channels
+- **Multi-channel delivery**: email and Telegram per pipeline, independently toggled
+- **Trustworthy filtering**: canonicalises, freshness-filters, and deduplicates items while preferring primary evidence; Gemini supplies bounded signals and local code computes the final capped ranking
+- **Safe trial runs**: `run_single_pipeline(pipeline, deliver=False)` renders and writes a collision-safe audit record without sending email or Telegram
+- **Project context**: paste a project description so the AI filters for what's relevant to your current work
+- **Run history**: last 14 runs visible in the control panel with item counts
+- **Background execution**: "Run now" returns instantly; pipeline runs in a background thread
 
 ---
 
@@ -128,10 +130,10 @@ where `BOT_TOKEN` is the full token from BotFather (e.g. `7123456789:AAHx...`) a
 
 ## Screenshots
 
-**Control panel — pipeline configuration**
+**Control panel: pipeline configuration**
 ![Pipeline config](screenshots/pipeline-config.png)
 
-**Delivery settings — email and Telegram**
+**Delivery settings: email and Telegram**
 ![Delivery settings](screenshots/delivery-settings.png)
 
 **Telegram delivery**
@@ -146,18 +148,33 @@ where `BOT_TOKEN` is the full token from BotFather (e.g. `7123456789:AAHx...`) a
 
 ### Why Gemini free tier instead of OpenAI?
 
-The classification step runs on ~150 items per pipeline per day. At GPT-4o pricing that adds up quickly. Gemini 2.5 Flash handles structured JSON output reliably on the free tier, keeping the running cost at zero for personal use.
+The classification step runs on ~150 items per run. At GPT-4o pricing that adds up quickly. Gemini 2.5 Flash handles structured JSON output reliably on the free tier, keeping the running cost at zero for personal use.
 
 ### Why RSS over the X (Twitter) API?
 
-The X API's free tier is not suitable for this daily scan. Active feed sources use unauthenticated RSS/Atom (including Reddit subreddit Atom feeds) or a bounded HTML collector. Anthropic News, the Meta AI Blog, and The Batch currently have no working RSS endpoints, so they remain in the source-policy registry as `web_only` canonical pages and are skipped rather than silently producing fetch errors. Feed hosts can still rate-limit or become unavailable.
+The X API's free tier is not suitable for this kind of scan. Active feed sources use unauthenticated RSS/Atom (including Reddit subreddit Atom feeds) or a bounded HTML collector. Anthropic News, the Meta AI Blog, and The Batch currently have no working RSS endpoints, so they remain in the source-policy registry as `web_only` canonical pages and are skipped rather than silently producing fetch errors. Feed hosts can still rate-limit or become unavailable.
 
 ### Why Flask instead of Django?
 
-The entire backend fits in two files. Django's ORM, admin, and migrations add complexity with no benefit here — there's no relational data, just a single JSON config file. Flask's minimal surface area also makes the codebase easier to audit and deploy on a fresh VPS in minutes.
+The entire backend fits in two files. Django's ORM, admin, and migrations add complexity with no benefit here, there's no relational data, just a single JSON config file. Flask's minimal surface area also makes the codebase easier to audit and deploy on a fresh VPS in minutes.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements.txt
+pytest -q
+```
+
+66 tests cover canonical IDs and deduplication, freshness and trust gates, ranking caps, model-response handling, repeat-safe delivery and the control-panel login.
+
+## How it was built
+
+Designed by me and built with AI coding agents. I set the editorial and trust rules, directed the agents, reviewed the output and defined the acceptance tests.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

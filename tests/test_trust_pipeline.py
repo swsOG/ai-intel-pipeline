@@ -744,3 +744,18 @@ def test_logs_redact_sensitive_fields_from_legacy_audits(monkeypatch, tmp_path):
     assert secret_key.encode() not in response.data
     assert b"recipient@example.com" not in response.data
     assert b"BOT-TOKEN" not in response.data
+
+
+def test_admin_login_refuses_missing_or_placeholder_password(monkeypatch):
+    import app as control_panel
+
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("ADMIN_USERNAME", "admin")
+    assert not control_panel._admin_credentials_ok("admin", "changeme")
+
+    monkeypatch.setenv("ADMIN_PASSWORD", "CHANGE_THIS_TO_YOUR_PASSWORD")
+    assert not control_panel._admin_credentials_ok("admin", "CHANGE_THIS_TO_YOUR_PASSWORD")
+
+    monkeypatch.setenv("ADMIN_PASSWORD", "a-real-long-password-123")
+    assert control_panel._admin_credentials_ok("admin", "a-real-long-password-123")
+    assert not control_panel._admin_credentials_ok("admin", "wrong")
